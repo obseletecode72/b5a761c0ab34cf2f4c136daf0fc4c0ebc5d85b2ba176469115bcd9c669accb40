@@ -49,7 +49,7 @@ static pthread_mutex_t g_filemtx=PTHREAD_MUTEX_INITIALIZER;
 
 static atomic_int G_tested,G_found,G_real,G_hp;
 static atomic_int G_done,G_active,G_next;
-static atomic_int G_tcp_ok,G_tcp_err,G_ssh_ok,G_ssh_err,G_wrong;
+static atomic_int G_tcp_ok,G_tcp_err,G_ssh_ok,G_ssh_err,G_wrong,G_sess_err;
 
 static int g_threads=200,g_timeout=5,g_maxconn=1000;
 static sem_t g_sem;
@@ -265,7 +265,7 @@ static void process(int idx) {
         }
 
         /* Session died (CLOSED/TCP_ERROR/TIMEOUT/PROTO_ERROR) */
-        atomic_fetch_add(&G_wrong, 1);
+        atomic_fetch_add(&G_sess_err, 1);
         close_session(ses);
         ses = NULL;
 
@@ -297,7 +297,7 @@ static void draw(){
     int real=atomic_load(&G_real),hp=atomic_load(&G_hp);
     int tcp_ok=atomic_load(&G_tcp_ok),tcp_err=atomic_load(&G_tcp_err);
     int ssh_ok=atomic_load(&G_ssh_ok),ssh_err=atomic_load(&G_ssh_err);
-    int wrong=atomic_load(&G_wrong);
+    int wrong=atomic_load(&G_wrong),sess_err=atomic_load(&G_sess_err);
     float pct=g_ntargets?(done*100.0f/g_ntargets):0;
     int spd=tested*60/el;
     int ips=done/el;
@@ -318,10 +318,11 @@ static void draw(){
 
     int tcp_tot=tcp_ok+tcp_err;
     int ssh_tot=ssh_ok+ssh_err;
-    printf("  %sTCP:%s %d/%d (%.0f%% ok)  %sSSH:%s %d/%d (%.0f%% ok)  %sWrong:%s %d\n\n",
+    printf("  %sTCP:%s %d/%d (%.0f%% ok)  %sSSH:%s %d/%d (%.0f%% ok)  %sWrong:%s %d  %sSessErr:%s %d\n\n",
            C_GRAY,C_RESET,tcp_ok,tcp_tot,tcp_tot?(tcp_ok*100.0f/tcp_tot):0,
            C_GRAY,C_RESET,ssh_ok,ssh_tot,ssh_tot?(ssh_ok*100.0f/ssh_tot):0,
-           C_GRAY,C_RESET,wrong);
+           C_GRAY,C_RESET,wrong,
+           C_RED,C_RESET,sess_err);
 
     pthread_mutex_lock(&g_resmtx);
     int st=(g_nresults>8)?g_nresults-8:0;
@@ -373,7 +374,7 @@ int main(int argc,char **argv){
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr,256*1024);
+    pthread_attr_setstacksize(&attr,128*1024);
 
     pthread_t panel;
     pthread_create(&panel,NULL,panel_fn,NULL);

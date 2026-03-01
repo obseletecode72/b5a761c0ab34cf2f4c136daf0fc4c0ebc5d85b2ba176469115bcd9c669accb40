@@ -25,6 +25,7 @@
 #include <time.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -161,6 +162,11 @@ static void put_cstring(unsigned char *buf, const char *str, int *offset) {
 static void put_mpint(unsigned char *buf, const BIGNUM *bn, int *offset) {
     int n = BN_num_bytes(bn);
     unsigned char *tmp = malloc(n + 1);
+    if (!tmp) { /* fallback: write zero-length mpint */
+        put_u32(buf + *offset, 0);
+        *offset += 4;
+        return;
+    }
     BN_bn2bin(bn, tmp);
     /* Check if leading byte has high bit set - need extra zero */
     int pad = (n > 0 && (tmp[0] & 0x80)) ? 1 : 0;
@@ -178,7 +184,10 @@ static void put_mpint(unsigned char *buf, const BIGNUM *bn, int *offset) {
 
 static int sock_wait(int fd, int events, int timeout_ms) {
     struct pollfd pf = {fd, events, 0};
-    return poll(&pf, 1, timeout_ms);
+    int r = poll(&pf, 1, timeout_ms);
+    if (r <= 0) return r; /* 0 = timeout, -1 = error */
+    if (pf.revents & (POLLERR | POLLHUP | POLLNVAL)) return -1;
+    return r;
 }
 
 static int raw_send(rawssh_session *s, const void *data, int len) {
@@ -186,7 +195,7 @@ static int raw_send(rawssh_session *s, const void *data, int len) {
     int sent = 0;
     while (sent < len) {
         int r = sock_wait(s->sock, POLLOUT, s->timeout_sec * 1000);
-        if (r <= 0) return RAWSSH_TIMEOUT;
+        if (r <= 0) return (r == 0) ? RAWSSH_TIMEOUT : RAWSSH_TCP_ERROR;
         r = send(s->sock, p + sent, len - sent, MSG_NOSIGNAL);
         if (r <= 0) return RAWSSH_TCP_ERROR;
         sent += r;
@@ -199,7 +208,7 @@ static int raw_recv(rawssh_session *s, void *data, int len) {
     int got = 0;
     while (got < len) {
         int r = sock_wait(s->sock, POLLIN, s->timeout_sec * 1000);
-        if (r <= 0) return RAWSSH_TIMEOUT;
+        if (r <= 0) return (r == 0) ? RAWSSH_TIMEOUT : RAWSSH_TCP_ERROR;
         r = recv(s->sock, p + got, len - got, 0);
         if (r <= 0) return RAWSSH_TCP_ERROR;
         got += r;
@@ -208,20 +217,35 @@ static int raw_recv(rawssh_session *s, void *data, int len) {
 }
 
 /* Read a line (for version exchange) */
+/* Optimized: use MSG_PEEK to find \n then read in bulk */
 static int read_line(rawssh_session *s, char *buf, int maxlen) {
     int pos = 0;
     while (pos < maxlen - 1) {
         int r = sock_wait(s->sock, POLLIN, s->timeout_sec * 1000);
         if (r <= 0) return RAWSSH_TIMEOUT;
-        char c;
-        r = recv(s->sock, &c, 1, 0);
+        /* Peek available data to find newline */
+        int avail = maxlen - 1 - pos;
+        r = recv(s->sock, buf + pos, avail, MSG_PEEK);
         if (r <= 0) return RAWSSH_TCP_ERROR;
-        if (c == '\n') {
+        /* Scan for \n in peeked data */
+        int nl = -1;
+        for (int i = 0; i < r; i++) {
+            if (buf[pos + i] == '\n') { nl = i; break; }
+        }
+        if (nl >= 0) {
+            /* Consume up to and including \n */
+            int consume = nl + 1;
+            r = recv(s->sock, buf + pos, consume, 0);
+            if (r <= 0) return RAWSSH_TCP_ERROR;
+            pos += nl; /* don't include \n */
             if (pos > 0 && buf[pos - 1] == '\r') pos--;
             buf[pos] = 0;
             return pos;
         }
-        buf[pos++] = c;
+        /* No newline yet - consume all peeked bytes */
+        r = recv(s->sock, buf + pos, r, 0);
+        if (r <= 0) return RAWSSH_TCP_ERROR;
+        pos += r;
     }
     buf[pos] = 0;
     return pos;
@@ -246,8 +270,9 @@ static int send_packet_plain(rawssh_session *s, const unsigned char *payload, in
 
     int rc = raw_send(s, pkt, total);
     free(pkt);
+    if (rc < 0) return rc;
     s->c2s.seq++;
-    return rc > 0 ? RAWSSH_OK : rc;
+    return RAWSSH_OK;
 }
 
 /* Send an encrypted SSH packet */
@@ -276,6 +301,7 @@ static int send_packet_encrypted(rawssh_session *s, const unsigned char *payload
 
         unsigned int hmac_len = 0;
         HMAC_CTX *hctx = HMAC_CTX_new();
+        if (!hctx) { free(plain); return RAWSSH_ALLOC_FAIL; }
         if (s->use_sha256) {
             HMAC_Init_ex(hctx, s->c2s.mac_key, 32, EVP_sha256(), NULL);
         } else {
@@ -289,22 +315,51 @@ static int send_packet_encrypted(rawssh_session *s, const unsigned char *payload
 
     /* Encrypt in place */
     unsigned char *enc = malloc(total);
+    if (!enc) { free(plain); return RAWSSH_ALLOC_FAIL; }
     int outl = 0;
     EVP_EncryptUpdate(s->c2s.ctx, enc, &outl, plain, total);
     free(plain);
 
-    /* Send encrypted data + MAC */
-    int rc = raw_send(s, enc, total);
-    free(enc);
-    if (rc < 0) return rc;
-
+    /* Send encrypted data + MAC in single syscall via writev */
+    int rc;
     if (mac_len > 0) {
-        rc = raw_send(s, mac, mac_len);
-        if (rc < 0) return rc;
+        struct iovec iov[2] = {
+            { .iov_base = enc, .iov_len = total },
+            { .iov_base = mac, .iov_len = mac_len }
+        };
+        int want = total + mac_len;
+        int sent = 0;
+        while (sent < want) {
+            int r = sock_wait(s->sock, POLLOUT, s->timeout_sec * 1000);
+            if (r <= 0) { free(enc); return (r == 0) ? RAWSSH_TIMEOUT : RAWSSH_TCP_ERROR; }
+            /* Adjust iov for partial writes */
+            int off = sent;
+            int iovcnt = 0;
+            struct iovec wv[2];
+            for (int i = 0; i < 2; i++) {
+                if (off >= (int)iov[i].iov_len) {
+                    off -= iov[i].iov_len;
+                } else {
+                    wv[iovcnt].iov_base = (char*)iov[i].iov_base + off;
+                    wv[iovcnt].iov_len = iov[i].iov_len - off;
+                    iovcnt++;
+                    off = 0;
+                }
+            }
+            ssize_t w = writev(s->sock, wv, iovcnt);
+            if (w <= 0) { free(enc); return RAWSSH_TCP_ERROR; }
+            sent += w;
+        }
+        rc = RAWSSH_OK;
+    } else {
+        rc = raw_send(s, enc, total);
+        if (rc < 0) { free(enc); return rc; }
+        rc = RAWSSH_OK;
     }
+    free(enc);
 
     s->c2s.seq++;
-    return RAWSSH_OK;
+    return rc;
 }
 
 static int send_packet(rawssh_session *s, const unsigned char *payload, int plen) {
@@ -392,6 +447,7 @@ static int recv_packet_encrypted(rawssh_session *s, unsigned char *payload, int 
 
         unsigned int hmac_len = 0;
         HMAC_CTX *hctx = HMAC_CTX_new();
+        if (!hctx) { free(full_dec); return RAWSSH_ALLOC_FAIL; }
         if (s->use_sha256) {
             HMAC_Init_ex(hctx, s->s2c.mac_key, 32, EVP_sha256(), NULL);
         } else {
@@ -949,8 +1005,16 @@ int rawssh_connect(rawssh_session *s, const char *host, int port) {
     struct linger lg = {1, 0};
     setsockopt(s->sock, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
 
-    /* Enable TCP keepalive */
+    /* Enable TCP keepalive with aggressive timers to kill zombie sockets */
     setsockopt(s->sock, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+    int keepidle = 5, keepintvl = 3, keepcnt = 3;
+    setsockopt(s->sock, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
+    setsockopt(s->sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+    setsockopt(s->sock, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
+
+#ifdef TCP_QUICKACK
+    setsockopt(s->sock, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
+#endif
 
     return RAWSSH_OK;
 }
@@ -1041,7 +1105,7 @@ int rawssh_auth_password(rawssh_session *s, const char *user, const char *pass) 
 }
 
 void rawssh_disconnect(rawssh_session *s) {
-    if (s->sock < 0) return;
+    if (!s || s->sock < 0) return;
 
     if (s->encrypted) {
         unsigned char payload[64];
@@ -1213,10 +1277,10 @@ void rawssh_channel_close(rawssh_channel *ch) {
     send_packet(s, payload, off);
     ch->closed = 1;
 
-    /* Drain pending close from server */
-    for (int i = 0; i < 5; i++) {
+    /* Drain pending close from server - fast timeout for brute force */
+    for (int i = 0; i < 3; i++) {
         struct pollfd pf = {s->sock, POLLIN, 0};
-        if (poll(&pf, 1, 500) <= 0) break;
+        if (poll(&pf, 1, 100) <= 0) break;
 
         unsigned char rpayload[RAWSSH_MAX_PAYLOAD];
         int rplen;
