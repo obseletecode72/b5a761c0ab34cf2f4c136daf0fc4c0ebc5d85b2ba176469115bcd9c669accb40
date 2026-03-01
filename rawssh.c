@@ -5,8 +5,8 @@
  * Suporte a bind direto na NIC (SO_BINDTODEVICE)
  *
  * Algoritmos suportados:
- *   KEX: diffie-hellman-group14-sha256, diffie-hellman-group14-sha1
- *   Host key: ssh-rsa
+ *   KEX: curve25519-sha256, ecdh-sha2-nistp256, diffie-hellman-group14/16
+ *   Host key: ssh-ed25519, ecdsa-sha2-nistp*, rsa-sha2-*, ssh-rsa
  *   Cipher: aes128-ctr, aes256-ctr
  *   MAC: hmac-sha2-256, hmac-sha1
  *   Compression: none
@@ -39,6 +39,8 @@
 #include <openssl/rsa.h>
 #include <openssl/pem.h>
 #include <openssl/err.h>
+#include <openssl/ec.h>
+#include <openssl/ecdh.h>
 
 /* ========== Internal structures ========== */
 
@@ -47,7 +49,7 @@ typedef struct {
     EVP_CIPHER_CTX *ctx;
     unsigned char key[RAWSSH_KEY_SIZE];
     unsigned char iv[RAWSSH_IV_SIZE];
-    unsigned char mac_key[RAWSSH_KEY_SIZE];
+    unsigned char mac_key[64]; /* up to 64 for sha512 */
     int cipher_block;
     int key_len;
     int mac_len;
@@ -78,9 +80,9 @@ struct rawssh_session {
     BIGNUM *dh_k; /* shared secret */
 
     /* Session ID and exchange hash */
-    unsigned char session_id[RAWSSH_HASH_SIZE];
+    unsigned char session_id[64];
     int session_id_len;
-    unsigned char exchange_hash[RAWSSH_HASH_SIZE];
+    unsigned char exchange_hash[64];
 
     /* Crypto state */
     crypto_dir c2s; /* client to server */
@@ -88,9 +90,10 @@ struct rawssh_session {
     int encrypted;
 
     /* KEX algorithm selection */
-    int use_sha256; /* 1 = SHA-256, 0 = SHA-1 */
+    int kex_type;       /* 0=dh-group14, 1=dh-group16, 2=curve25519, 3=ecdh-p256 */
+    int kex_hash_type;  /* 0=sha1, 1=sha256, 2=sha512 */
     int cipher_key_len; /* 16 or 32 */
-
+    int mac_is_sha256;  /* independent from kex hash */
 
     /* Authenticated flag */
     int authenticated;
@@ -302,7 +305,7 @@ static int send_packet_encrypted(rawssh_session *s, const unsigned char *payload
         unsigned int hmac_len = 0;
         HMAC_CTX *hctx = HMAC_CTX_new();
         if (!hctx) { free(plain); return RAWSSH_ALLOC_FAIL; }
-        if (s->use_sha256) {
+        if (s->c2s.mac_len >= 32) {
             HMAC_Init_ex(hctx, s->c2s.mac_key, 32, EVP_sha256(), NULL);
         } else {
             HMAC_Init_ex(hctx, s->c2s.mac_key, 20, EVP_sha1(), NULL);
@@ -448,7 +451,7 @@ static int recv_packet_encrypted(rawssh_session *s, unsigned char *payload, int 
         unsigned int hmac_len = 0;
         HMAC_CTX *hctx = HMAC_CTX_new();
         if (!hctx) { free(full_dec); return RAWSSH_ALLOC_FAIL; }
-        if (s->use_sha256) {
+        if (s->s2c.mac_len >= 32) {
             HMAC_Init_ex(hctx, s->s2c.mac_key, 32, EVP_sha256(), NULL);
         } else {
             HMAC_Init_ex(hctx, s->s2c.mac_key, 20, EVP_sha1(), NULL);
@@ -501,44 +504,68 @@ static const char *dh_group14_p_hex =
     "DE2BCBF6955817183995497CEA956AE515D2261898FA0510"
     "15728E5A8AACAA68FFFFFFFFFFFFFFFF";
 
+/* RFC 3526 - Group 16 (4096-bit MODP) */
+static const char *dh_group16_p_hex =
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
+    "29024E088A67CC74020BBEA63B139B22514A08798E3404DD"
+    "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245"
+    "E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED"
+    "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3D"
+    "C2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F"
+    "83655D23DCA3AD961C62F356208552BB9ED529077096966D"
+    "670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B"
+    "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9"
+    "DE2BCBF6955817183995497CEA956AE515D2261898FA0510"
+    "15728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64"
+    "ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7"
+    "ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6B"
+    "F12FFA06D98A0864D87602733EC86A64521F2B18177B200C"
+    "BBE117577A615D6C770988C0BAD946E208E24FA074E5AB31"
+    "43DB5BFCE0FD108E4B82D120A92108011A723C12A787E6D7"
+    "88719A10BDBA5B2699C327186AF4E23C1A946834B6150BDA"
+    "2583E9CA2AD44CE8DBBBC2DB04DE8EF92E8EFC141FBECAA6"
+    "287C59474E6BC05D99B2964FA090C3A2233BA186515BE7ED"
+    "1F612970CEE2D7AFB81BDD762170481CD0069127D5B05AA9"
+    "93B4EA988D8FDDC186FFB7DC90A6C08F4DF435C934063199"
+    "FFFFFFFFFFFFFFFF";
+
+/* Helper: get EVP_MD for KEX hash */
+static const EVP_MD *get_kex_md(rawssh_session *s) {
+    switch (s->kex_hash_type) {
+        case 2:  return EVP_sha512();
+        case 1:  return EVP_sha256();
+        default: return EVP_sha1();
+    }
+}
+
+#define KEX_LIST "curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256,diffie-hellman-group14-sha256,diffie-hellman-group16-sha512,diffie-hellman-group14-sha1"
+#define HOSTKEY_LIST "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-256,rsa-sha2-512,ssh-rsa"
+#define CIPHER_LIST "aes128-ctr,aes256-ctr"
+#define MAC_LIST "hmac-sha2-256,hmac-sha1"
+
 /* Build KEXINIT packet */
 static int build_kexinit(rawssh_session *s) {
     unsigned char payload[2048];
     int off = 0;
 
     payload[off++] = SSH_MSG_KEXINIT;
-
-    /* 16 bytes cookie */
     RAND_bytes(payload + off, 16);
     off += 16;
 
-    /* kex_algorithms */
-    put_cstring(payload, "diffie-hellman-group14-sha256,diffie-hellman-group14-sha1", &off);
-    /* server_host_key_algorithms - accept all since we skip verification */
-    put_cstring(payload, "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-256,rsa-sha2-512,ssh-rsa", &off);
-    /* encryption_algorithms_client_to_server - CTR only (CBC not implemented) */
-    put_cstring(payload, "aes128-ctr,aes256-ctr", &off);
-    /* encryption_algorithms_server_to_client */
-    put_cstring(payload, "aes128-ctr,aes256-ctr", &off);
-    /* mac_algorithms_client_to_server */
-    put_cstring(payload, "hmac-sha2-256,hmac-sha1", &off);
-    /* mac_algorithms_server_to_client */
-    put_cstring(payload, "hmac-sha2-256,hmac-sha1", &off);
-    /* compression_algorithms_client_to_server */
+    put_cstring(payload, KEX_LIST, &off);
+    put_cstring(payload, HOSTKEY_LIST, &off);
+    put_cstring(payload, CIPHER_LIST, &off);
+    put_cstring(payload, CIPHER_LIST, &off);
+    put_cstring(payload, MAC_LIST, &off);
+    put_cstring(payload, MAC_LIST, &off);
     put_cstring(payload, "none", &off);
-    /* compression_algorithms_server_to_client */
     put_cstring(payload, "none", &off);
-    /* languages_client_to_server */
     put_cstring(payload, "", &off);
-    /* languages_server_to_client */
     put_cstring(payload, "", &off);
-    /* first_kex_packet_follows */
     payload[off++] = 0;
-    /* reserved */
     put_u32(payload + off, 0);
     off += 4;
 
-    /* Save for hash computation */
     s->my_kexinit = malloc(off);
     memcpy(s->my_kexinit, payload, off);
     s->my_kexinit_len = off;
@@ -618,38 +645,41 @@ static int parse_kexinit(rawssh_session *s, const unsigned char *payload, int pl
     char chosen_kex[64], chosen_cipher_c2s[64], chosen_cipher_s2c[64];
     char chosen_mac_c2s[64], chosen_mac_s2c[64], chosen_hostkey[64];
 
-    if (find_match("diffie-hellman-group14-sha256,diffie-hellman-group14-sha1",
-                   server_kex, chosen_kex, sizeof(chosen_kex)) < 0)
+    if (find_match(KEX_LIST, server_kex, chosen_kex, sizeof(chosen_kex)) < 0)
         return RAWSSH_PROTO_ERROR;
 
-    s->use_sha256 = (strstr(chosen_kex, "sha256") != NULL);
+    /* Determine KEX type and hash */
+    if (strstr(chosen_kex, "curve25519")) {
+        s->kex_type = 2; s->kex_hash_type = 1; /* sha256 */
+    } else if (strstr(chosen_kex, "ecdh-sha2-nistp256")) {
+        s->kex_type = 3; s->kex_hash_type = 1;
+    } else if (strstr(chosen_kex, "group16")) {
+        s->kex_type = 1; s->kex_hash_type = 2; /* sha512 */
+    } else if (strstr(chosen_kex, "group14-sha256")) {
+        s->kex_type = 0; s->kex_hash_type = 1;
+    } else {
+        s->kex_type = 0; s->kex_hash_type = 0; /* sha1 */
+    }
 
-    /* Host key - accept anything since we don't verify signatures */
-    if (find_match("ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-256,rsa-sha2-512,ssh-rsa",
-                   server_hostkey, chosen_hostkey, sizeof(chosen_hostkey)) < 0)
+    if (find_match(HOSTKEY_LIST, server_hostkey, chosen_hostkey, sizeof(chosen_hostkey)) < 0)
         return RAWSSH_PROTO_ERROR;
 
-    /* Cipher - CTR only */
-    if (find_match("aes128-ctr,aes256-ctr",
-                   server_enc_c2s, chosen_cipher_c2s, sizeof(chosen_cipher_c2s)) < 0)
+    if (find_match(CIPHER_LIST, server_enc_c2s, chosen_cipher_c2s, sizeof(chosen_cipher_c2s)) < 0)
         return RAWSSH_PROTO_ERROR;
-    if (find_match("aes128-ctr,aes256-ctr",
-                   server_enc_s2c, chosen_cipher_s2c, sizeof(chosen_cipher_s2c)) < 0)
+    if (find_match(CIPHER_LIST, server_enc_s2c, chosen_cipher_s2c, sizeof(chosen_cipher_s2c)) < 0)
         return RAWSSH_PROTO_ERROR;
 
-    /* Determine key length from c2s cipher (both should match) */
     if (strstr(chosen_cipher_c2s, "aes256"))
         s->cipher_key_len = 32;
     else
         s->cipher_key_len = 16;
 
-    /* MAC */
-    if (find_match("hmac-sha2-256,hmac-sha1",
-                   server_mac_c2s, chosen_mac_c2s, sizeof(chosen_mac_c2s)) < 0)
+    if (find_match(MAC_LIST, server_mac_c2s, chosen_mac_c2s, sizeof(chosen_mac_c2s)) < 0)
         return RAWSSH_PROTO_ERROR;
-    if (find_match("hmac-sha2-256,hmac-sha1",
-                   server_mac_s2c, chosen_mac_s2c, sizeof(chosen_mac_s2c)) < 0)
+    if (find_match(MAC_LIST, server_mac_s2c, chosen_mac_s2c, sizeof(chosen_mac_s2c)) < 0)
         return RAWSSH_PROTO_ERROR;
+
+    s->mac_is_sha256 = (strstr(chosen_mac_c2s, "sha2-256") != NULL);
 
     return RAWSSH_OK;
 }
@@ -657,10 +687,9 @@ static int parse_kexinit(rawssh_session *s, const unsigned char *payload, int pl
 /* Derive a key using the SSH key derivation (RFC 4253 Section 7.2) */
 static void derive_key(rawssh_session *s, char id, int need,
                        unsigned char *out) {
-    const EVP_MD *md = s->use_sha256 ? EVP_sha256() : EVP_sha1();
+    const EVP_MD *md = get_kex_md(s);
     int hash_len = EVP_MD_size(md);
 
-    /* K (as mpint) */
     int klen = BN_num_bytes(s->dh_k);
     unsigned char *kbuf = malloc(klen + 5);
     int koff = 0;
@@ -680,7 +709,6 @@ static void derive_key(rawssh_session *s, char id, int need,
     int got = hlen < (unsigned)need ? hlen : need;
     memcpy(out, hash, got);
 
-    /* If we need more bytes, keep hashing */
     while (got < need) {
         EVP_DigestInit_ex(ctx, md, NULL);
         EVP_DigestUpdate(ctx, kbuf, koff);
@@ -696,165 +724,111 @@ static void derive_key(rawssh_session *s, char id, int need,
     free(kbuf);
 }
 
-/* Compute exchange hash H */
+/* Exchange hash for DH (e,f are mpints) */
 static int compute_exchange_hash(rawssh_session *s,
                                   const unsigned char *k_s, int k_s_len,
                                   const BIGNUM *e, const BIGNUM *f,
                                   const BIGNUM *k) {
-    const EVP_MD *md = s->use_sha256 ? EVP_sha256() : EVP_sha1();
+    const EVP_MD *md = get_kex_md(s);
     EVP_MD_CTX *ctx = EVP_MD_CTX_new();
     EVP_DigestInit_ex(ctx, md, NULL);
 
-    /* V_C (client version) */
     int off = 0;
     unsigned char tmp[8192];
     put_cstring(tmp, s->client_version, &off);
     EVP_DigestUpdate(ctx, tmp, off);
-
-    /* V_S (server version) */
     off = 0;
     put_cstring(tmp, s->server_version, &off);
     EVP_DigestUpdate(ctx, tmp, off);
 
-    /* I_C (client KEXINIT) */
-    off = 0;
     put_u32(tmp, s->my_kexinit_len);
-    off = 4;
     EVP_DigestUpdate(ctx, tmp, 4);
     EVP_DigestUpdate(ctx, s->my_kexinit, s->my_kexinit_len);
-
-    /* I_S (server KEXINIT) */
     put_u32(tmp, s->peer_kexinit_len);
     EVP_DigestUpdate(ctx, tmp, 4);
     EVP_DigestUpdate(ctx, s->peer_kexinit, s->peer_kexinit_len);
 
-    /* K_S (host key) */
     off = 0;
     put_string(tmp, k_s, k_s_len, &off);
     EVP_DigestUpdate(ctx, tmp, off);
-
-    /* e (client DH public) */
-    off = 0;
-    put_mpint(tmp, e, &off);
-    EVP_DigestUpdate(ctx, tmp, off);
-
-    /* f (server DH public) */
-    off = 0;
-    put_mpint(tmp, f, &off);
-    EVP_DigestUpdate(ctx, tmp, off);
-
-    /* K (shared secret) */
-    off = 0;
-    put_mpint(tmp, k, &off);
-    EVP_DigestUpdate(ctx, tmp, off);
+    off = 0; put_mpint(tmp, e, &off); EVP_DigestUpdate(ctx, tmp, off);
+    off = 0; put_mpint(tmp, f, &off); EVP_DigestUpdate(ctx, tmp, off);
+    off = 0; put_mpint(tmp, k, &off); EVP_DigestUpdate(ctx, tmp, off);
 
     unsigned int hlen;
     EVP_DigestFinal_ex(ctx, s->exchange_hash, &hlen);
     EVP_MD_CTX_free(ctx);
 
     s->session_id_len = hlen;
-    if (!s->session_id[0] && !s->session_id[1]) {
-        /* First KEX - set session id */
+    if (!s->session_id[0] && !s->session_id[1])
         memcpy(s->session_id, s->exchange_hash, hlen);
-    }
-
     return RAWSSH_OK;
 }
 
-/* Perform DH key exchange - group14 */
-static int do_kex_dh(rawssh_session *s) {
-    /* Initialize DH parameters - group 14 */
-    s->dh_p = BN_new();
-    s->dh_g = BN_new();
-    s->dh_x = BN_new();
-    s->dh_e = BN_new();
+/* Exchange hash for ECDH/curve25519 (Q_C, Q_S are strings, not mpints) */
+static int compute_exchange_hash_ecdh(rawssh_session *s,
+                                       const unsigned char *k_s, int k_s_len,
+                                       const unsigned char *q_c, int q_c_len,
+                                       const unsigned char *q_s, int q_s_len) {
+    const EVP_MD *md = get_kex_md(s);
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(ctx, md, NULL);
 
-    BN_hex2bn(&s->dh_p, dh_group14_p_hex);
-    BN_set_word(s->dh_g, 2);
-
-    /* Generate private key x (random, 256 bits) */
-    BN_rand(s->dh_x, 256, BN_RAND_TOP_ONE, BN_RAND_BOTTOM_ANY);
-
-    /* Compute e = g^x mod p */
-    BN_CTX *bnctx = BN_CTX_new();
-    BN_mod_exp(s->dh_e, s->dh_g, s->dh_x, s->dh_p, bnctx);
-
-    /* Send SSH_MSG_KEXDH_INIT */
-    unsigned char payload[1024];
     int off = 0;
-    payload[off++] = SSH_MSG_KEXDH_INIT;
-    put_mpint(payload, s->dh_e, &off);
+    unsigned char tmp[8192];
+    put_cstring(tmp, s->client_version, &off);
+    EVP_DigestUpdate(ctx, tmp, off);
+    off = 0;
+    put_cstring(tmp, s->server_version, &off);
+    EVP_DigestUpdate(ctx, tmp, off);
 
-    int rc = send_packet(s, payload, off);
-    if (rc < 0) { BN_CTX_free(bnctx); return rc; }
+    put_u32(tmp, s->my_kexinit_len);
+    EVP_DigestUpdate(ctx, tmp, 4);
+    EVP_DigestUpdate(ctx, s->my_kexinit, s->my_kexinit_len);
+    put_u32(tmp, s->peer_kexinit_len);
+    EVP_DigestUpdate(ctx, tmp, 4);
+    EVP_DigestUpdate(ctx, s->peer_kexinit, s->peer_kexinit_len);
 
-    /* Receive SSH_MSG_KEXDH_REPLY */
+    off = 0;
+    put_string(tmp, k_s, k_s_len, &off);
+    EVP_DigestUpdate(ctx, tmp, off);
+    off = 0; put_string(tmp, q_c, q_c_len, &off); EVP_DigestUpdate(ctx, tmp, off);
+    off = 0; put_string(tmp, q_s, q_s_len, &off); EVP_DigestUpdate(ctx, tmp, off);
+    off = 0; put_mpint(tmp, s->dh_k, &off); EVP_DigestUpdate(ctx, tmp, off);
+
+    unsigned int hlen;
+    EVP_DigestFinal_ex(ctx, s->exchange_hash, &hlen);
+    EVP_MD_CTX_free(ctx);
+
+    s->session_id_len = hlen;
+    if (!s->session_id[0] && !s->session_id[1])
+        memcpy(s->session_id, s->exchange_hash, hlen);
+    return RAWSSH_OK;
+}
+
+/* Complete KEX: NEWKEYS exchange + key derivation (shared by all KEX types) */
+static int complete_kex(rawssh_session *s) {
+    unsigned char nk = SSH_MSG_NEWKEYS;
+    int rc = send_packet(s, &nk, 1);
+    if (rc < 0) return rc;
+
     unsigned char rpayload[RAWSSH_MAX_PAYLOAD];
     int rplen;
-    rc = recv_packet(s, rpayload, &rplen);
-    if (rc < 0) { BN_CTX_free(bnctx); return rc; }
-    if (rpayload[0] != SSH_MSG_KEXDH_REPLY) { BN_CTX_free(bnctx); return RAWSSH_PROTO_ERROR; }
-
-    /* Parse: K_S (host key), f (server DH public), signature */
-    off = 1;
-    const unsigned char *k_s_data;
-    uint32_t k_s_len;
-    if (get_string(rpayload, rplen, &off, &k_s_data, &k_s_len) < 0) {
-        BN_CTX_free(bnctx);
-        return RAWSSH_PROTO_ERROR;
-    }
-
-    const unsigned char *f_data;
-    uint32_t f_len;
-    if (get_string(rpayload, rplen, &off, &f_data, &f_len) < 0) {
-        BN_CTX_free(bnctx);
-        return RAWSSH_PROTO_ERROR;
-    }
-
-    /* Parse f as BIGNUM */
-    s->dh_f = BN_new();
-    BN_bin2bn(f_data, f_len, s->dh_f);
-
-    /* Skip signature (we don't verify host key for brute force) */
-
-    /* Compute shared secret K = f^x mod p */
-    s->dh_k = BN_new();
-    BN_mod_exp(s->dh_k, s->dh_f, s->dh_x, s->dh_p, bnctx);
-    BN_CTX_free(bnctx);
-
-    /* Compute exchange hash */
-    rc = compute_exchange_hash(s, k_s_data, k_s_len, s->dh_e, s->dh_f, s->dh_k);
-    if (rc < 0) return rc;
-
-    /* Send SSH_MSG_NEWKEYS */
-    unsigned char nk = SSH_MSG_NEWKEYS;
-    rc = send_packet(s, &nk, 1);
-    if (rc < 0) return rc;
-
-    /* Receive SSH_MSG_NEWKEYS */
     rc = recv_packet(s, rpayload, &rplen);
     if (rc < 0) return rc;
     if (rpayload[0] != SSH_MSG_NEWKEYS) return RAWSSH_PROTO_ERROR;
 
-    /* Derive keys */
     int kl = s->cipher_key_len;
-    int bl = 16; /* AES block size */
-    int mac_kl = s->use_sha256 ? 32 : 20;
+    int bl = 16;
+    int mac_kl = s->mac_is_sha256 ? 32 : 20;
 
-    /* IV client to server */
     derive_key(s, 'A', bl, s->c2s.iv);
-    /* IV server to client */
     derive_key(s, 'B', bl, s->s2c.iv);
-    /* Encryption key c2s */
     derive_key(s, 'C', kl, s->c2s.key);
-    /* Encryption key s2c */
     derive_key(s, 'D', kl, s->s2c.key);
-    /* MAC key c2s */
     derive_key(s, 'E', mac_kl, s->c2s.mac_key);
-    /* MAC key s2c */
     derive_key(s, 'F', mac_kl, s->s2c.mac_key);
 
-    /* Initialize cipher contexts */
     const EVP_CIPHER *cipher = (kl == 32) ? EVP_aes_256_ctr() : EVP_aes_128_ctr();
 
     s->c2s.ctx = EVP_CIPHER_CTX_new();
@@ -869,13 +843,167 @@ static int do_kex_dh(rawssh_session *s) {
     s->s2c.key_len = kl;
     s->s2c.mac_len = mac_kl;
 
-    /* CTR mode doesn't need padding */
     EVP_CIPHER_CTX_set_padding(s->c2s.ctx, 0);
     EVP_CIPHER_CTX_set_padding(s->s2c.ctx, 0);
-
     s->encrypted = 1;
-
     return RAWSSH_OK;
+}
+
+/* ========== KEX: DH group14/group16 ========== */
+static int do_kex_dh(rawssh_session *s) {
+    s->dh_p = BN_new(); s->dh_g = BN_new();
+    s->dh_x = BN_new(); s->dh_e = BN_new();
+
+    if (s->kex_type == 1) /* group16 */
+        BN_hex2bn(&s->dh_p, dh_group16_p_hex);
+    else
+        BN_hex2bn(&s->dh_p, dh_group14_p_hex);
+    BN_set_word(s->dh_g, 2);
+
+    BN_rand(s->dh_x, 256, BN_RAND_TOP_ONE, BN_RAND_BOTTOM_ANY);
+    BN_CTX *bnctx = BN_CTX_new();
+    BN_mod_exp(s->dh_e, s->dh_g, s->dh_x, s->dh_p, bnctx);
+
+    unsigned char payload[1024];
+    int off = 0;
+    payload[off++] = SSH_MSG_KEXDH_INIT;
+    put_mpint(payload, s->dh_e, &off);
+
+    int rc = send_packet(s, payload, off);
+    if (rc < 0) { BN_CTX_free(bnctx); return rc; }
+
+    unsigned char rpayload[RAWSSH_MAX_PAYLOAD];
+    int rplen;
+    rc = recv_packet(s, rpayload, &rplen);
+    if (rc < 0) { BN_CTX_free(bnctx); return rc; }
+    if (rpayload[0] != SSH_MSG_KEXDH_REPLY) { BN_CTX_free(bnctx); return RAWSSH_PROTO_ERROR; }
+
+    off = 1;
+    const unsigned char *k_s_data; uint32_t k_s_len;
+    if (get_string(rpayload, rplen, &off, &k_s_data, &k_s_len) < 0) { BN_CTX_free(bnctx); return RAWSSH_PROTO_ERROR; }
+    const unsigned char *f_data; uint32_t f_len;
+    if (get_string(rpayload, rplen, &off, &f_data, &f_len) < 0) { BN_CTX_free(bnctx); return RAWSSH_PROTO_ERROR; }
+
+    s->dh_f = BN_new();
+    BN_bin2bn(f_data, f_len, s->dh_f);
+    s->dh_k = BN_new();
+    BN_mod_exp(s->dh_k, s->dh_f, s->dh_x, s->dh_p, bnctx);
+    BN_CTX_free(bnctx);
+
+    rc = compute_exchange_hash(s, k_s_data, k_s_len, s->dh_e, s->dh_f, s->dh_k);
+    if (rc < 0) return rc;
+    return complete_kex(s);
+}
+
+/* ========== KEX: curve25519-sha256 ========== */
+static int do_kex_curve25519(rawssh_session *s) {
+    EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
+    if (!pctx) return RAWSSH_ALLOC_FAIL;
+    EVP_PKEY_keygen_init(pctx);
+    EVP_PKEY *ckey = NULL;
+    EVP_PKEY_keygen(pctx, &ckey);
+    EVP_PKEY_CTX_free(pctx);
+    if (!ckey) return RAWSSH_ALLOC_FAIL;
+
+    unsigned char cpub[32];
+    size_t cpub_len = 32;
+    EVP_PKEY_get_raw_public_key(ckey, cpub, &cpub_len);
+
+    unsigned char payload[64];
+    int off = 0;
+    payload[off++] = SSH_MSG_KEXDH_INIT; /* 30 */
+    put_string(payload, cpub, 32, &off);
+
+    int rc = send_packet(s, payload, off);
+    if (rc < 0) { EVP_PKEY_free(ckey); return rc; }
+
+    unsigned char rpayload[RAWSSH_MAX_PAYLOAD];
+    int rplen;
+    rc = recv_packet(s, rpayload, &rplen);
+    if (rc < 0) { EVP_PKEY_free(ckey); return rc; }
+    if (rpayload[0] != SSH_MSG_KEXDH_REPLY) { EVP_PKEY_free(ckey); return RAWSSH_PROTO_ERROR; }
+
+    off = 1;
+    const unsigned char *k_s; uint32_t k_s_len;
+    if (get_string(rpayload, rplen, &off, &k_s, &k_s_len) < 0) { EVP_PKEY_free(ckey); return RAWSSH_PROTO_ERROR; }
+    const unsigned char *spub; uint32_t spub_len;
+    if (get_string(rpayload, rplen, &off, &spub, &spub_len) < 0) { EVP_PKEY_free(ckey); return RAWSSH_PROTO_ERROR; }
+
+    EVP_PKEY *skey = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, spub, spub_len);
+    if (!skey) { EVP_PKEY_free(ckey); return RAWSSH_PROTO_ERROR; }
+
+    EVP_PKEY_CTX *dctx = EVP_PKEY_CTX_new(ckey, NULL);
+    EVP_PKEY_derive_init(dctx);
+    EVP_PKEY_derive_set_peer(dctx, skey);
+    size_t sec_len = 32;
+    unsigned char secret[32];
+    EVP_PKEY_derive(dctx, secret, &sec_len);
+    EVP_PKEY_CTX_free(dctx);
+    EVP_PKEY_free(skey);
+    EVP_PKEY_free(ckey);
+
+    s->dh_k = BN_new();
+    BN_bin2bn(secret, sec_len, s->dh_k);
+
+    rc = compute_exchange_hash_ecdh(s, k_s, k_s_len, cpub, 32, spub, spub_len);
+    if (rc < 0) return rc;
+    return complete_kex(s);
+}
+
+/* ========== KEX: ecdh-sha2-nistp256 ========== */
+static int do_kex_ecdh_p256(rawssh_session *s) {
+    EC_KEY *ec = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+    if (!ec) return RAWSSH_ALLOC_FAIL;
+    if (!EC_KEY_generate_key(ec)) { EC_KEY_free(ec); return RAWSSH_ALLOC_FAIL; }
+
+    const EC_GROUP *grp = EC_KEY_get0_group(ec);
+    const EC_POINT *pub = EC_KEY_get0_public_key(ec);
+    size_t cpub_len = EC_POINT_point2oct(grp, pub, POINT_CONVERSION_UNCOMPRESSED, NULL, 0, NULL);
+    unsigned char *cpub = malloc(cpub_len);
+    EC_POINT_point2oct(grp, pub, POINT_CONVERSION_UNCOMPRESSED, cpub, cpub_len, NULL);
+
+    unsigned char payload[128];
+    int off = 0;
+    payload[off++] = SSH_MSG_KEXDH_INIT;
+    put_string(payload, cpub, cpub_len, &off);
+
+    int rc = send_packet(s, payload, off);
+    if (rc < 0) { free(cpub); EC_KEY_free(ec); return rc; }
+
+    unsigned char rpayload[RAWSSH_MAX_PAYLOAD];
+    int rplen;
+    rc = recv_packet(s, rpayload, &rplen);
+    if (rc < 0) { free(cpub); EC_KEY_free(ec); return rc; }
+    if (rpayload[0] != SSH_MSG_KEXDH_REPLY) { free(cpub); EC_KEY_free(ec); return RAWSSH_PROTO_ERROR; }
+
+    off = 1;
+    const unsigned char *k_s; uint32_t k_s_len;
+    if (get_string(rpayload, rplen, &off, &k_s, &k_s_len) < 0) { free(cpub); EC_KEY_free(ec); return RAWSSH_PROTO_ERROR; }
+    const unsigned char *spub_data; uint32_t spub_len;
+    if (get_string(rpayload, rplen, &off, &spub_data, &spub_len) < 0) { free(cpub); EC_KEY_free(ec); return RAWSSH_PROTO_ERROR; }
+
+    EC_POINT *spub = EC_POINT_new(grp);
+    if (!EC_POINT_oct2point(grp, spub, spub_data, spub_len, NULL)) {
+        EC_POINT_free(spub); free(cpub); EC_KEY_free(ec);
+        return RAWSSH_PROTO_ERROR;
+    }
+
+    int field_size = (EC_GROUP_get_degree(grp) + 7) / 8;
+    unsigned char *secret = malloc(field_size);
+    int sec_len = ECDH_compute_key(secret, field_size, spub, ec, NULL);
+    EC_POINT_free(spub);
+
+    if (sec_len <= 0) { free(secret); free(cpub); EC_KEY_free(ec); return RAWSSH_PROTO_ERROR; }
+
+    s->dh_k = BN_new();
+    BN_bin2bn(secret, sec_len, s->dh_k);
+    free(secret);
+
+    rc = compute_exchange_hash_ecdh(s, k_s, k_s_len, cpub, cpub_len, spub_data, spub_len);
+    free(cpub);
+    EC_KEY_free(ec);
+    if (rc < 0) return rc;
+    return complete_kex(s);
 }
 
 /* ========== Service Request & User Auth ========== */
@@ -1070,8 +1198,12 @@ int rawssh_handshake(rawssh_session *s) {
     rc = parse_kexinit(s, rpayload, rplen);
     if (rc < 0) return rc;
 
-    /* Perform DH key exchange */
-    rc = do_kex_dh(s);
+    /* Perform key exchange based on negotiated algorithm */
+    switch (s->kex_type) {
+        case 2: rc = do_kex_curve25519(s); break;
+        case 3: rc = do_kex_ecdh_p256(s); break;
+        default: rc = do_kex_dh(s); break; /* group14 or group16 */
+    }
     if (rc < 0) return rc;
 
     /* Request ssh-userauth service */

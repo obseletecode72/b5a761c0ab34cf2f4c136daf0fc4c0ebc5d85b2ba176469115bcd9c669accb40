@@ -60,7 +60,7 @@
 #define RAWSSH_IV_SIZE       16
 #define RAWSSH_KEY_SIZE      32
 #define RAWSSH_MAC_SIZE      32
-#define RAWSSH_HASH_SIZE     32
+#define RAWSSH_HASH_SIZE     64
 
 /* Forward declarations */
 typedef struct rawssh_session rawssh_session;
