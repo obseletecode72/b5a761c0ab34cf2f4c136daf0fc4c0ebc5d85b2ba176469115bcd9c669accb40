@@ -1093,14 +1093,19 @@ int rawssh_auth_password(rawssh_session *s, const char *user, const char *pass) 
     put_cstring(payload, pass, &off);
 
     int rc = send_packet(s, payload, off);
-    if (rc < 0) return rc;
+    if (rc < 0) return RAWSSH_CLOSED; /* Can't send = connection dead */
 
     unsigned char rpayload[RAWSSH_MAX_PAYLOAD];
     int rplen;
 
     for (int i = 0; i < 10; i++) {
         rc = recv_packet(s, rpayload, &rplen);
-        if (rc < 0) return rc;
+        if (rc < 0) {
+            /* Server dropped connection - likely MaxAuthTries exceeded.
+             * Return CLOSED so caller reconnects cleanly instead of
+             * counting it as an unexpected error. */
+            return RAWSSH_CLOSED;
+        }
 
         if (rpayload[0] == SSH_MSG_USERAUTH_SUCCESS) {
             s->authenticated = 1;

