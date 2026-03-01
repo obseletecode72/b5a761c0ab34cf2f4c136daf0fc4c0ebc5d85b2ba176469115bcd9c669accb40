@@ -493,7 +493,8 @@ static int build_kexinit(rawssh_session *s) {
 /* Find first matching algorithm from comma-separated lists */
 static int find_match(const char *client, const char *server, char *out, int outlen) {
     char *ccopy = strdup(client);
-    char *tok = strtok(ccopy, ",");
+    char *saveptr = NULL;
+    char *tok = strtok_r(ccopy, ",", &saveptr);
     while (tok) {
         /* Check if tok appears in server list */
         const char *p = server;
@@ -508,7 +509,7 @@ static int find_match(const char *client, const char *server, char *out, int out
             }
             p = comma ? comma + 1 : NULL;
         }
-        tok = strtok(NULL, ",");
+        tok = strtok_r(NULL, ",", &saveptr);
     }
     free(ccopy);
     return -1;
