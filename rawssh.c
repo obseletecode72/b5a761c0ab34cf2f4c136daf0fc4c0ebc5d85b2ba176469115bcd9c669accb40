@@ -91,10 +91,6 @@ struct rawssh_session {
     int use_sha256; /* 1 = SHA-256, 0 = SHA-1 */
     int cipher_key_len; /* 16 or 32 */
 
-    /* Read buffer */
-    unsigned char rbuf[RAWSSH_MAX_PACKET * 2];
-    int rpos;
-    int rlen;
 
     /* Authenticated flag */
     int authenticated;
@@ -186,7 +182,11 @@ static int sock_wait(int fd, int events, int timeout_ms) {
     struct pollfd pf = {fd, events, 0};
     int r = poll(&pf, 1, timeout_ms);
     if (r <= 0) return r; /* 0 = timeout, -1 = error */
-    if (pf.revents & (POLLERR | POLLHUP | POLLNVAL)) return -1;
+    if (pf.revents & POLLNVAL) return -1;
+    /* For reads: POLLIN with POLLHUP means data still available - allow it */
+    if ((events & POLLIN) && (pf.revents & POLLIN)) return r;
+    /* For writes or pure POLLHUP/POLLERR without data: error */
+    if (pf.revents & (POLLERR | POLLHUP)) return -1;
     return r;
 }
 
@@ -514,12 +514,12 @@ static int build_kexinit(rawssh_session *s) {
 
     /* kex_algorithms */
     put_cstring(payload, "diffie-hellman-group14-sha256,diffie-hellman-group14-sha1", &off);
-    /* server_host_key_algorithms */
-    put_cstring(payload, "ssh-rsa,rsa-sha2-256,rsa-sha2-512", &off);
-    /* encryption_algorithms_client_to_server */
-    put_cstring(payload, "aes128-ctr,aes256-ctr,aes128-cbc,aes256-cbc", &off);
+    /* server_host_key_algorithms - accept all since we skip verification */
+    put_cstring(payload, "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-256,rsa-sha2-512,ssh-rsa", &off);
+    /* encryption_algorithms_client_to_server - CTR only (CBC not implemented) */
+    put_cstring(payload, "aes128-ctr,aes256-ctr", &off);
     /* encryption_algorithms_server_to_client */
-    put_cstring(payload, "aes128-ctr,aes256-ctr,aes128-cbc,aes256-cbc", &off);
+    put_cstring(payload, "aes128-ctr,aes256-ctr", &off);
     /* mac_algorithms_client_to_server */
     put_cstring(payload, "hmac-sha2-256,hmac-sha1", &off);
     /* mac_algorithms_server_to_client */
@@ -615,7 +615,8 @@ static int parse_kexinit(rawssh_session *s, const unsigned char *payload, int pl
     snprintf(server_mac_s2c, sizeof(server_mac_s2c), "%.*s", (int)dlen, (char *)data);
 
     /* Negotiate */
-    char chosen_kex[64], chosen_cipher[64], chosen_mac[64];
+    char chosen_kex[64], chosen_cipher_c2s[64], chosen_cipher_s2c[64];
+    char chosen_mac_c2s[64], chosen_mac_s2c[64], chosen_hostkey[64];
 
     if (find_match("diffie-hellman-group14-sha256,diffie-hellman-group14-sha1",
                    server_kex, chosen_kex, sizeof(chosen_kex)) < 0)
@@ -623,18 +624,31 @@ static int parse_kexinit(rawssh_session *s, const unsigned char *payload, int pl
 
     s->use_sha256 = (strstr(chosen_kex, "sha256") != NULL);
 
-    if (find_match("aes128-ctr,aes256-ctr,aes128-cbc,aes256-cbc",
-                   server_enc_c2s, chosen_cipher, sizeof(chosen_cipher)) < 0)
+    /* Host key - accept anything since we don't verify signatures */
+    if (find_match("ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-256,rsa-sha2-512,ssh-rsa",
+                   server_hostkey, chosen_hostkey, sizeof(chosen_hostkey)) < 0)
         return RAWSSH_PROTO_ERROR;
 
-    /* Determine key length from cipher */
-    if (strstr(chosen_cipher, "aes256"))
+    /* Cipher - CTR only */
+    if (find_match("aes128-ctr,aes256-ctr",
+                   server_enc_c2s, chosen_cipher_c2s, sizeof(chosen_cipher_c2s)) < 0)
+        return RAWSSH_PROTO_ERROR;
+    if (find_match("aes128-ctr,aes256-ctr",
+                   server_enc_s2c, chosen_cipher_s2c, sizeof(chosen_cipher_s2c)) < 0)
+        return RAWSSH_PROTO_ERROR;
+
+    /* Determine key length from c2s cipher (both should match) */
+    if (strstr(chosen_cipher_c2s, "aes256"))
         s->cipher_key_len = 32;
     else
         s->cipher_key_len = 16;
 
+    /* MAC */
     if (find_match("hmac-sha2-256,hmac-sha1",
-                   server_mac_c2s, chosen_mac, sizeof(chosen_mac)) < 0)
+                   server_mac_c2s, chosen_mac_c2s, sizeof(chosen_mac_c2s)) < 0)
+        return RAWSSH_PROTO_ERROR;
+    if (find_match("hmac-sha2-256,hmac-sha1",
+                   server_mac_s2c, chosen_mac_s2c, sizeof(chosen_mac_s2c)) < 0)
         return RAWSSH_PROTO_ERROR;
 
     return RAWSSH_OK;
@@ -895,14 +909,19 @@ static int request_service(rawssh_session *s, const char *service) {
 /* ========== Public API ========== */
 
 int rawssh_global_init(void) {
+    /* OpenSSL 1.1.0+ auto-inits and is thread-safe by default */
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
     OpenSSL_add_all_algorithms();
     ERR_load_crypto_strings();
+#endif
     return RAWSSH_OK;
 }
 
 void rawssh_global_cleanup(void) {
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
     EVP_cleanup();
     ERR_free_strings();
+#endif
 }
 
 rawssh_session *rawssh_session_new(void) {
