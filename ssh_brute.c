@@ -340,7 +340,7 @@ int main(int argc,char **argv){
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr,64*1024);
+    pthread_attr_setstacksize(&attr,256*1024);
 
     pthread_t panel;
     pthread_create(&panel,NULL,panel_fn,NULL);

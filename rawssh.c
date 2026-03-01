@@ -1106,7 +1106,7 @@ rawssh_channel *rawssh_channel_open(rawssh_session *s) {
 int rawssh_channel_exec(rawssh_channel *ch, const char *cmd) {
     rawssh_session *s = ch->session;
 
-    unsigned char payload[RAWSSH_MAX_PAYLOAD];
+    unsigned char payload[2048];
     int off = 0;
     payload[off++] = SSH_MSG_CHANNEL_REQUEST;
     put_u32(payload + off, ch->remote_id); off += 4;

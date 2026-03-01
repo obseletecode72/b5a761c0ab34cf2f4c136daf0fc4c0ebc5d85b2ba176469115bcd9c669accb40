@@ -54,8 +54,8 @@
 #define SSH_MSG_CHANNEL_FAILURE      100
 
 /* Buffer sizes */
-#define RAWSSH_MAX_PACKET    35000
-#define RAWSSH_MAX_PAYLOAD   32768
+#define RAWSSH_MAX_PACKET    16384
+#define RAWSSH_MAX_PAYLOAD   8192
 #define RAWSSH_BLOCK_SIZE    16
 #define RAWSSH_IV_SIZE       16
 #define RAWSSH_KEY_SIZE      32
