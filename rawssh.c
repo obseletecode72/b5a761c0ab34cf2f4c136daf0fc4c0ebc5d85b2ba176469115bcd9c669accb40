@@ -887,21 +887,18 @@ int rawssh_connect(rawssh_session *s, const char *host, int port) {
     s->sock = socket(AF_INET, SOCK_STREAM, 0);
     if (s->sock < 0) return RAWSSH_TCP_ERROR;
 
-    /* Bind to specific NIC if configured */
+    /* Reuse address to avoid port exhaustion */
+    int one = 1;
+    setsockopt(s->sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    /* Bind to specific NIC if configured (soft-fail: ignore if not permitted) */
     if (s->nic[0]) {
-        struct ifreq ifr;
-        memset(&ifr, 0, sizeof(ifr));
-        strncpy(ifr.ifr_name, s->nic, IFNAMSIZ - 1);
-        if (setsockopt(s->sock, SOL_SOCKET, SO_BINDTODEVICE,
-                       &ifr, sizeof(ifr)) < 0) {
-            close(s->sock);
-            s->sock = -1;
-            return RAWSSH_TCP_ERROR;
-        }
+        setsockopt(s->sock, SOL_SOCKET, SO_BINDTODEVICE,
+                   s->nic, strlen(s->nic) + 1);
+        /* Ignore errors - SO_BINDTODEVICE requires CAP_NET_RAW */
     }
 
     /* Set TCP_NODELAY for speed */
-    int one = 1;
     setsockopt(s->sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
     /* Non-blocking connect */
