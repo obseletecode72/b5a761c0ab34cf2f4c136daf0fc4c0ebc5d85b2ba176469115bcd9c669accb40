@@ -241,7 +241,7 @@ static void close_session(rawssh_session *ses) {
  * for the server to disconnect us (slow + wastes a round-trip),
  * we proactively close and reopen the session.
  */
-#define AUTH_PER_CONN 3
+#define AUTH_PER_CONN 5
 
 static void process(int idx) {
     Target *t = &g_targets[idx];

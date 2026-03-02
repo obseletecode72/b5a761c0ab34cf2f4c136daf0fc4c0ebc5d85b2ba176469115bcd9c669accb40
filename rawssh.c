@@ -276,7 +276,8 @@ static int send_packet_plain(rawssh_session *s, const unsigned char *payload, in
     if (padlen < 4) padlen += block;
     int total = 4 + 1 + plen + padlen;
 
-    unsigned char *pkt = malloc(total);
+    unsigned char _sb[512];
+    unsigned char *pkt = (total <= (int)sizeof(_sb)) ? _sb : malloc(total);
     if (!pkt) return RAWSSH_ALLOC_FAIL;
 
     put_u32(pkt, 1 + plen + padlen);
@@ -285,7 +286,7 @@ static int send_packet_plain(rawssh_session *s, const unsigned char *payload, in
     RAND_bytes(pkt + 5 + plen, padlen);
 
     int rc = raw_send(s, pkt, total);
-    free(pkt);
+    if (pkt != _sb) free(pkt);
     if (rc < 0) return rc;
     s->c2s.seq++;
     return RAWSSH_OK;
@@ -300,7 +301,9 @@ static int send_packet_chacha20(rawssh_session *s, const unsigned char *payload,
     int pktlen = 1 + plen + padlen;
     int total = 4 + pktlen;
 
-    unsigned char *plain = malloc(total);
+    /* Stack buffers for typical small packets - avoids malloc in hot path */
+    unsigned char _sb_plain[512], _sb_enc[512], _sb_send[512];
+    unsigned char *plain = (total <= (int)sizeof(_sb_plain)) ? _sb_plain : malloc(total);
     if (!plain) return RAWSSH_ALLOC_FAIL;
 
     put_u32(plain, pktlen);
@@ -308,36 +311,26 @@ static int send_packet_chacha20(rawssh_session *s, const unsigned char *payload,
     memcpy(plain + 5, payload, plen);
     RAND_bytes(plain + 5 + plen, padlen);
 
-    /* OpenSSL EVP_chacha20 IV layout: 4 bytes counter (LE) + 12 bytes nonce
-     * SSH chacha20-poly1305 nonce = 8-byte big-endian sequence number
-     * We place it at the END of the 12-byte nonce field: 4 zero + 8-byte seqno */
     unsigned char chacha_iv[16];
     memset(chacha_iv, 0, 16);
-    /* counter = 0 at bytes 0-3 (already zeroed) */
-    /* nonce padding at bytes 4-7 (already zeroed) */
-    put_u32(chacha_iv + 12, s->c2s.seq); /* seqno at bytes 12-15 (big-endian, but only 32-bit) */
-    /* Actually per openssh: nonce is 8 bytes, placed as the full 12-byte nonce:
-     * bytes 4-7 = 0, bytes 8-11 = 0, bytes 12-15 = seqno
-     * But OpenSSL nonce is 12 bytes at IV[4..15] */
-    memset(chacha_iv + 4, 0, 8); /* first 8 bytes of nonce = 0 */
-    put_u32(chacha_iv + 12, s->c2s.seq); /* last 4 bytes of nonce = seqno */
+    put_u32(chacha_iv + 12, s->c2s.seq);
 
-    /* Step 1: Encrypt packet length (4 bytes) with header key (K_2, stored at mac_key) */
+    /* Step 1: Encrypt packet length (4 bytes) with header key */
     unsigned char enc_len[4];
     {
         EVP_CIPHER_CTX *hctx = EVP_CIPHER_CTX_new();
-        if (!hctx) { free(plain); return RAWSSH_ALLOC_FAIL; }
+        if (!hctx) { if (plain != _sb_plain) free(plain); return RAWSSH_ALLOC_FAIL; }
         EVP_EncryptInit_ex(hctx, EVP_chacha20(), NULL, s->c2s.mac_key, chacha_iv);
         int outl = 0;
         EVP_EncryptUpdate(hctx, enc_len, &outl, plain, 4);
         EVP_CIPHER_CTX_free(hctx);
     }
 
-    /* Step 2: Derive Poly1305 one-time key from counter=0 block of main key */
+    /* Step 2: Derive Poly1305 one-time key */
     unsigned char poly_key[32];
     {
         EVP_CIPHER_CTX *kctx = EVP_CIPHER_CTX_new();
-        if (!kctx) { free(plain); return RAWSSH_ALLOC_FAIL; }
+        if (!kctx) { if (plain != _sb_plain) free(plain); return RAWSSH_ALLOC_FAIL; }
         EVP_EncryptInit_ex(kctx, EVP_chacha20(), NULL, s->c2s.key, chacha_iv);
         unsigned char zeros[32] = {0};
         int outl = 0;
@@ -345,15 +338,13 @@ static int send_packet_chacha20(rawssh_session *s, const unsigned char *payload,
         EVP_CIPHER_CTX_free(kctx);
     }
 
-    /* Step 3: Encrypt payload with main key, counter starting at 1
-     * Skip first 64 bytes (counter block 0 used for poly1305 key) */
-    unsigned char *enc_payload = malloc(pktlen);
-    if (!enc_payload) { free(plain); return RAWSSH_ALLOC_FAIL; }
+    /* Step 3: Encrypt payload */
+    unsigned char *enc_payload = (pktlen <= (int)sizeof(_sb_enc)) ? _sb_enc : malloc(pktlen);
+    if (!enc_payload) { if (plain != _sb_plain) free(plain); return RAWSSH_ALLOC_FAIL; }
     {
         EVP_CIPHER_CTX *pctx = EVP_CIPHER_CTX_new();
-        if (!pctx) { free(enc_payload); free(plain); return RAWSSH_ALLOC_FAIL; }
+        if (!pctx) { if (enc_payload != _sb_enc) free(enc_payload); if (plain != _sb_plain) free(plain); return RAWSSH_ALLOC_FAIL; }
         EVP_EncryptInit_ex(pctx, EVP_chacha20(), NULL, s->c2s.key, chacha_iv);
-        /* Discard first 64 bytes to advance past counter=0 block */
         unsigned char discard[64];
         int outl = 0;
         EVP_EncryptUpdate(pctx, discard, &outl, discard, 64);
@@ -361,16 +352,16 @@ static int send_packet_chacha20(rawssh_session *s, const unsigned char *payload,
         EVP_EncryptUpdate(pctx, enc_payload, &outl, plain + 4, pktlen);
         EVP_CIPHER_CTX_free(pctx);
     }
-    free(plain);
+    if (plain != _sb_plain) free(plain);
 
-    /* Step 4: Compute Poly1305 tag over encrypted_length + encrypted_payload */
+    /* Step 4: Compute Poly1305 tag */
     unsigned char tag[16];
     {
         EVP_MAC *mac = EVP_MAC_fetch(NULL, "POLY1305", NULL);
-        if (!mac) { free(enc_payload); return RAWSSH_ALLOC_FAIL; }
+        if (!mac) { if (enc_payload != _sb_enc) free(enc_payload); return RAWSSH_ALLOC_FAIL; }
         EVP_MAC_CTX *mctx = EVP_MAC_CTX_new(mac);
         EVP_MAC_free(mac);
-        if (!mctx) { free(enc_payload); return RAWSSH_ALLOC_FAIL; }
+        if (!mctx) { if (enc_payload != _sb_enc) free(enc_payload); return RAWSSH_ALLOC_FAIL; }
         EVP_MAC_init(mctx, poly_key, 32, NULL);
         EVP_MAC_update(mctx, enc_len, 4);
         EVP_MAC_update(mctx, enc_payload, pktlen);
@@ -380,15 +371,16 @@ static int send_packet_chacha20(rawssh_session *s, const unsigned char *payload,
     }
 
     /* Send: encrypted_length(4) + encrypted_payload(pktlen) + tag(16) */
-    unsigned char *sendbuf = malloc(4 + pktlen + 16);
-    if (!sendbuf) { free(enc_payload); return RAWSSH_ALLOC_FAIL; }
+    int sendlen = 4 + pktlen + 16;
+    unsigned char *sendbuf = (sendlen <= (int)sizeof(_sb_send)) ? _sb_send : malloc(sendlen);
+    if (!sendbuf) { if (enc_payload != _sb_enc) free(enc_payload); return RAWSSH_ALLOC_FAIL; }
     memcpy(sendbuf, enc_len, 4);
     memcpy(sendbuf + 4, enc_payload, pktlen);
     memcpy(sendbuf + 4 + pktlen, tag, 16);
-    free(enc_payload);
+    if (enc_payload != _sb_enc) free(enc_payload);
 
-    int rc = raw_send(s, sendbuf, 4 + pktlen + 16);
-    free(sendbuf);
+    int rc = raw_send(s, sendbuf, sendlen);
+    if (sendbuf != _sb_send) free(sendbuf);
     if (rc < 0) return rc;
 
     s->c2s.seq++;
@@ -407,7 +399,9 @@ static int send_packet_encrypted(rawssh_session *s, const unsigned char *payload
     int pktlen = 1 + plen + padlen;
     int total = 4 + pktlen;
 
-    unsigned char *plain = malloc(total);
+    /* Stack buffers for typical small packets */
+    unsigned char _sb_plain[512], _sb_enc[512];
+    unsigned char *plain = (total <= (int)sizeof(_sb_plain)) ? _sb_plain : malloc(total);
     if (!plain) return RAWSSH_ALLOC_FAIL;
 
     put_u32(plain, pktlen);
@@ -424,7 +418,7 @@ static int send_packet_encrypted(rawssh_session *s, const unsigned char *payload
 
         unsigned int hmac_len = 0;
         HMAC_CTX *hctx = HMAC_CTX_new();
-        if (!hctx) { free(plain); return RAWSSH_ALLOC_FAIL; }
+        if (!hctx) { if (plain != _sb_plain) free(plain); return RAWSSH_ALLOC_FAIL; }
         if (s->c2s.mac_len >= 32) {
             HMAC_Init_ex(hctx, s->c2s.mac_key, 32, EVP_sha256(), NULL);
         } else {
@@ -436,12 +430,12 @@ static int send_packet_encrypted(rawssh_session *s, const unsigned char *payload
         HMAC_CTX_free(hctx);
     }
 
-    /* Encrypt in place */
-    unsigned char *enc = malloc(total);
-    if (!enc) { free(plain); return RAWSSH_ALLOC_FAIL; }
+    /* Encrypt */
+    unsigned char *enc = (total <= (int)sizeof(_sb_enc)) ? _sb_enc : malloc(total);
+    if (!enc) { if (plain != _sb_plain) free(plain); return RAWSSH_ALLOC_FAIL; }
     int outl = 0;
     EVP_EncryptUpdate(s->c2s.ctx, enc, &outl, plain, total);
-    free(plain);
+    if (plain != _sb_plain) free(plain);
 
     /* Send encrypted data + MAC in single syscall via writev */
     int rc;
@@ -454,8 +448,7 @@ static int send_packet_encrypted(rawssh_session *s, const unsigned char *payload
         int sent = 0;
         while (sent < want) {
             int r = sock_wait(s->sock, POLLOUT, s->timeout_sec * 1000);
-            if (r <= 0) { free(enc); return (r == 0) ? RAWSSH_TIMEOUT : RAWSSH_TCP_ERROR; }
-            /* Adjust iov for partial writes */
+            if (r <= 0) { if (enc != _sb_enc) free(enc); return (r == 0) ? RAWSSH_TIMEOUT : RAWSSH_TCP_ERROR; }
             int off = sent;
             int iovcnt = 0;
             struct iovec wv[2];
@@ -470,16 +463,16 @@ static int send_packet_encrypted(rawssh_session *s, const unsigned char *payload
                 }
             }
             ssize_t w = writev(s->sock, wv, iovcnt);
-            if (w <= 0) { free(enc); return RAWSSH_TCP_ERROR; }
+            if (w <= 0) { if (enc != _sb_enc) free(enc); return RAWSSH_TCP_ERROR; }
             sent += w;
         }
         rc = RAWSSH_OK;
     } else {
         rc = raw_send(s, enc, total);
-        if (rc < 0) { free(enc); return rc; }
+        if (rc < 0) { if (enc != _sb_enc) free(enc); return rc; }
         rc = RAWSSH_OK;
     }
-    free(enc);
+    if (enc != _sb_enc) free(enc);
 
     s->c2s.seq++;
     return rc;
@@ -501,39 +494,37 @@ static int recv_packet_plain(rawssh_session *s, unsigned char *payload, int *ple
     uint32_t pktlen = get_u32(hdr);
     if (pktlen > RAWSSH_MAX_PACKET || pktlen < 2) return RAWSSH_PROTO_ERROR;
 
-    unsigned char *pkt = malloc(pktlen);
+    unsigned char _sb[2048];
+    unsigned char *pkt = (pktlen <= sizeof(_sb)) ? _sb : malloc(pktlen);
     if (!pkt) return RAWSSH_ALLOC_FAIL;
 
     rc = raw_recv(s, pkt, pktlen);
-    if (rc < 0) { free(pkt); return rc; }
+    if (rc < 0) { if (pkt != _sb) free(pkt); return rc; }
 
     int padlen = pkt[0];
     int datalen = pktlen - padlen - 1;
     if (datalen < 0 || datalen > RAWSSH_MAX_PAYLOAD) {
-        free(pkt);
+        if (pkt != _sb) free(pkt);
         return RAWSSH_PROTO_ERROR;
     }
 
     memcpy(payload, pkt + 1, datalen);
     *plen = datalen;
-    free(pkt);
+    if (pkt != _sb) free(pkt);
     s->s2c.seq++;
     return RAWSSH_OK;
 }
 
 /* Receive an encrypted SSH packet - chacha20-poly1305 AEAD mode */
 static int recv_packet_chacha20(rawssh_session *s, unsigned char *payload, int *plen) {
-    /* Step 1: Read encrypted length (4 bytes) */
     unsigned char enc_len[4];
     int rc = raw_recv(s, enc_len, 4);
     if (rc < 0) return rc;
 
-    /* Build IV: 4-byte LE counter (0) + 12-byte nonce (4 zero + 4 zero + 4 seqno BE) */
     unsigned char chacha_iv[16];
     memset(chacha_iv, 0, 16);
     put_u32(chacha_iv + 12, s->s2c.seq);
 
-    /* Decrypt length using header key (K_2, stored in mac_key) */
     unsigned char dec_len_buf[4];
     {
         EVP_CIPHER_CTX *hctx = EVP_CIPHER_CTX_new();
@@ -547,21 +538,22 @@ static int recv_packet_chacha20(rawssh_session *s, unsigned char *payload, int *
     uint32_t pktlen = get_u32(dec_len_buf);
     if (pktlen > RAWSSH_MAX_PACKET || pktlen < 2) return RAWSSH_PROTO_ERROR;
 
-    /* Step 2: Read encrypted payload + tag */
-    unsigned char *enc_payload = malloc(pktlen);
+    /* Stack buffers for typical small packets */
+    unsigned char _sb_enc[512], _sb_dec[512];
+    unsigned char *enc_payload = (pktlen <= sizeof(_sb_enc)) ? _sb_enc : malloc(pktlen);
     if (!enc_payload) return RAWSSH_ALLOC_FAIL;
     rc = raw_recv(s, enc_payload, pktlen);
-    if (rc < 0) { free(enc_payload); return rc; }
+    if (rc < 0) { if (enc_payload != _sb_enc) free(enc_payload); return rc; }
 
     unsigned char tag_recv[16];
     rc = raw_recv(s, tag_recv, 16);
-    if (rc < 0) { free(enc_payload); return rc; }
+    if (rc < 0) { if (enc_payload != _sb_enc) free(enc_payload); return rc; }
 
-    /* Step 3: Derive Poly1305 key and verify tag */
+    /* Derive Poly1305 key and verify tag */
     unsigned char poly_key[32];
     {
         EVP_CIPHER_CTX *kctx = EVP_CIPHER_CTX_new();
-        if (!kctx) { free(enc_payload); return RAWSSH_ALLOC_FAIL; }
+        if (!kctx) { if (enc_payload != _sb_enc) free(enc_payload); return RAWSSH_ALLOC_FAIL; }
         EVP_EncryptInit_ex(kctx, EVP_chacha20(), NULL, s->s2c.key, chacha_iv);
         unsigned char zeros[32] = {0};
         int outl = 0;
@@ -572,10 +564,10 @@ static int recv_packet_chacha20(rawssh_session *s, unsigned char *payload, int *
     unsigned char tag_calc[16];
     {
         EVP_MAC *mac = EVP_MAC_fetch(NULL, "POLY1305", NULL);
-        if (!mac) { free(enc_payload); return RAWSSH_ALLOC_FAIL; }
+        if (!mac) { if (enc_payload != _sb_enc) free(enc_payload); return RAWSSH_ALLOC_FAIL; }
         EVP_MAC_CTX *mctx = EVP_MAC_CTX_new(mac);
         EVP_MAC_free(mac);
-        if (!mctx) { free(enc_payload); return RAWSSH_ALLOC_FAIL; }
+        if (!mctx) { if (enc_payload != _sb_enc) free(enc_payload); return RAWSSH_ALLOC_FAIL; }
         EVP_MAC_init(mctx, poly_key, 32, NULL);
         EVP_MAC_update(mctx, enc_len, 4);
         EVP_MAC_update(mctx, enc_payload, pktlen);
@@ -585,18 +577,17 @@ static int recv_packet_chacha20(rawssh_session *s, unsigned char *payload, int *
     }
 
     if (CRYPTO_memcmp(tag_recv, tag_calc, 16) != 0) {
-        free(enc_payload);
+        if (enc_payload != _sb_enc) free(enc_payload);
         return RAWSSH_PROTO_ERROR;
     }
 
-    /* Step 4: Decrypt payload with main key, counter starting at 1 */
-    unsigned char *dec_payload = malloc(pktlen);
-    if (!dec_payload) { free(enc_payload); return RAWSSH_ALLOC_FAIL; }
+    /* Decrypt payload */
+    unsigned char *dec_payload = (pktlen <= sizeof(_sb_dec)) ? _sb_dec : malloc(pktlen);
+    if (!dec_payload) { if (enc_payload != _sb_enc) free(enc_payload); return RAWSSH_ALLOC_FAIL; }
     {
         EVP_CIPHER_CTX *pctx = EVP_CIPHER_CTX_new();
-        if (!pctx) { free(dec_payload); free(enc_payload); return RAWSSH_ALLOC_FAIL; }
+        if (!pctx) { if (dec_payload != _sb_dec) free(dec_payload); if (enc_payload != _sb_enc) free(enc_payload); return RAWSSH_ALLOC_FAIL; }
         EVP_DecryptInit_ex(pctx, EVP_chacha20(), NULL, s->s2c.key, chacha_iv);
-        /* Skip first 64 bytes (counter block 0 used for poly1305 key) */
         unsigned char discard[64];
         int outl = 0;
         EVP_DecryptUpdate(pctx, discard, &outl, discard, 64);
@@ -604,18 +595,18 @@ static int recv_packet_chacha20(rawssh_session *s, unsigned char *payload, int *
         EVP_DecryptUpdate(pctx, dec_payload, &outl, enc_payload, pktlen);
         EVP_CIPHER_CTX_free(pctx);
     }
-    free(enc_payload);
+    if (enc_payload != _sb_enc) free(enc_payload);
 
     int padlen = dec_payload[0];
     int datalen = pktlen - padlen - 1;
     if (datalen < 0 || datalen > RAWSSH_MAX_PAYLOAD) {
-        free(dec_payload);
+        if (dec_payload != _sb_dec) free(dec_payload);
         return RAWSSH_PROTO_ERROR;
     }
 
     memcpy(payload, dec_payload + 1, datalen);
     *plen = datalen;
-    free(dec_payload);
+    if (dec_payload != _sb_dec) free(dec_payload);
     s->s2c.seq++;
     return RAWSSH_OK;
 }
@@ -628,7 +619,6 @@ static int recv_packet_encrypted(rawssh_session *s, unsigned char *payload, int 
     int block = s->s2c.cipher_block;
     if (block < 8) block = 8;
 
-    /* Read first block to get packet length */
     unsigned char first_block[32];
     int rc = raw_recv(s, first_block, block);
     if (rc < 0) return rc;
@@ -641,21 +631,23 @@ static int recv_packet_encrypted(rawssh_session *s, unsigned char *payload, int 
     if (pktlen > RAWSSH_MAX_PACKET || pktlen < 2) return RAWSSH_PROTO_ERROR;
 
     int remaining = 4 + pktlen - block;
-    unsigned char *full_enc = NULL;
-    unsigned char *full_dec = malloc(4 + pktlen);
+    unsigned char _sb_dec[2048];
+    int dec_size = 4 + pktlen;
+    unsigned char *full_dec = (dec_size <= (int)sizeof(_sb_dec)) ? _sb_dec : malloc(dec_size);
     if (!full_dec) return RAWSSH_ALLOC_FAIL;
 
     memcpy(full_dec, dec_first, block);
 
     if (remaining > 0) {
-        full_enc = malloc(remaining);
-        if (!full_enc) { free(full_dec); return RAWSSH_ALLOC_FAIL; }
+        unsigned char _sb_enc[2048];
+        unsigned char *full_enc = (remaining <= (int)sizeof(_sb_enc)) ? _sb_enc : malloc(remaining);
+        if (!full_enc) { if (full_dec != _sb_dec) free(full_dec); return RAWSSH_ALLOC_FAIL; }
         rc = raw_recv(s, full_enc, remaining);
-        if (rc < 0) { free(full_enc); free(full_dec); return rc; }
+        if (rc < 0) { if (full_enc != _sb_enc) free(full_enc); if (full_dec != _sb_dec) free(full_dec); return rc; }
 
         outl = 0;
         EVP_DecryptUpdate(s->s2c.ctx, full_dec + block, &outl, full_enc, remaining);
-        free(full_enc);
+        if (full_enc != _sb_enc) free(full_enc);
     }
 
     /* Read and verify MAC */
@@ -663,16 +655,15 @@ static int recv_packet_encrypted(rawssh_session *s, unsigned char *payload, int 
     if (mac_len > 0) {
         unsigned char mac_recv[RAWSSH_MAC_SIZE];
         rc = raw_recv(s, mac_recv, mac_len);
-        if (rc < 0) { free(full_dec); return rc; }
+        if (rc < 0) { if (full_dec != _sb_dec) free(full_dec); return rc; }
 
-        /* Compute expected MAC */
         unsigned char mac_calc[RAWSSH_MAC_SIZE];
         unsigned char seqbuf[4];
         put_u32(seqbuf, s->s2c.seq);
 
         unsigned int hmac_len = 0;
         HMAC_CTX *hctx = HMAC_CTX_new();
-        if (!hctx) { free(full_dec); return RAWSSH_ALLOC_FAIL; }
+        if (!hctx) { if (full_dec != _sb_dec) free(full_dec); return RAWSSH_ALLOC_FAIL; }
         if (s->s2c.mac_len >= 32) {
             HMAC_Init_ex(hctx, s->s2c.mac_key, 32, EVP_sha256(), NULL);
         } else {
@@ -684,7 +675,7 @@ static int recv_packet_encrypted(rawssh_session *s, unsigned char *payload, int 
         HMAC_CTX_free(hctx);
 
         if (CRYPTO_memcmp(mac_recv, mac_calc, mac_len) != 0) {
-            free(full_dec);
+            if (full_dec != _sb_dec) free(full_dec);
             return RAWSSH_PROTO_ERROR;
         }
     }
@@ -692,13 +683,13 @@ static int recv_packet_encrypted(rawssh_session *s, unsigned char *payload, int 
     int padlen = full_dec[4];
     int datalen = pktlen - padlen - 1;
     if (datalen < 0 || datalen > RAWSSH_MAX_PAYLOAD) {
-        free(full_dec);
+        if (full_dec != _sb_dec) free(full_dec);
         return RAWSSH_PROTO_ERROR;
     }
 
     memcpy(payload, full_dec + 5, datalen);
     *plen = datalen;
-    free(full_dec);
+    if (full_dec != _sb_dec) free(full_dec);
     s->s2c.seq++;
     return RAWSSH_OK;
 }
@@ -1534,7 +1525,9 @@ int rawssh_connect(rawssh_session *s, const char *host, int port) {
     connect(s->sock, (struct sockaddr *)&addr, sizeof(addr));
 
     struct pollfd pf = {s->sock, POLLOUT, 0};
-    if (poll(&pf, 1, s->timeout_sec * 1000) <= 0) {
+    /* Cap connect timeout at 2s - dead hosts waste less time */
+    int connect_tmo = (s->timeout_sec > 2) ? 2000 : s->timeout_sec * 1000;
+    if (poll(&pf, 1, connect_tmo) <= 0) {
         close(s->sock);
         s->sock = -1;
         return RAWSSH_TIMEOUT;
