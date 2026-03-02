@@ -202,7 +202,12 @@ static int raw_send(rawssh_session *s, const void *data, int len) {
         int r = sock_wait(s->sock, POLLOUT, s->timeout_sec * 1000);
         if (r <= 0) return (r == 0) ? RAWSSH_TIMEOUT : RAWSSH_TCP_ERROR;
         r = send(s->sock, p + sent, len - sent, MSG_NOSIGNAL);
-        if (r <= 0) return RAWSSH_TCP_ERROR;
+        if (r < 0) {
+            if (errno == EPIPE || errno == ECONNRESET)
+                return RAWSSH_CLOSED;
+            return RAWSSH_TCP_ERROR;
+        }
+        if (r == 0) return RAWSSH_CLOSED;
         sent += r;
     }
     return sent;
@@ -215,7 +220,12 @@ static int raw_recv(rawssh_session *s, void *data, int len) {
         int r = sock_wait(s->sock, POLLIN, s->timeout_sec * 1000);
         if (r <= 0) return (r == 0) ? RAWSSH_TIMEOUT : RAWSSH_TCP_ERROR;
         r = recv(s->sock, p + got, len - got, 0);
-        if (r <= 0) return RAWSSH_TCP_ERROR;
+        if (r < 0) {
+            if (errno == ECONNRESET)
+                return RAWSSH_CLOSED;
+            return RAWSSH_TCP_ERROR;
+        }
+        if (r == 0) return RAWSSH_CLOSED; /* peer closed connection */
         got += r;
     }
     return got;
@@ -227,11 +237,12 @@ static int read_line(rawssh_session *s, char *buf, int maxlen) {
     int pos = 0;
     while (pos < maxlen - 1) {
         int r = sock_wait(s->sock, POLLIN, s->timeout_sec * 1000);
-        if (r <= 0) return RAWSSH_TIMEOUT;
+        if (r <= 0) return (r == 0) ? RAWSSH_TIMEOUT : RAWSSH_TCP_ERROR;
         /* Peek available data to find newline */
         int avail = maxlen - 1 - pos;
         r = recv(s->sock, buf + pos, avail, MSG_PEEK);
-        if (r <= 0) return RAWSSH_TCP_ERROR;
+        if (r < 0) return (errno == ECONNRESET) ? RAWSSH_CLOSED : RAWSSH_TCP_ERROR;
+        if (r == 0) return RAWSSH_CLOSED; /* peer closed before sending version */
         /* Scan for \n in peeked data */
         int nl = -1;
         for (int i = 0; i < r; i++) {
@@ -241,7 +252,7 @@ static int read_line(rawssh_session *s, char *buf, int maxlen) {
             /* Consume up to and including \n */
             int consume = nl + 1;
             r = recv(s->sock, buf + pos, consume, 0);
-            if (r <= 0) return RAWSSH_TCP_ERROR;
+            if (r <= 0) return RAWSSH_CLOSED;
             pos += nl; /* don't include \n */
             if (pos > 0 && buf[pos - 1] == '\r') pos--;
             buf[pos] = 0;
@@ -249,7 +260,7 @@ static int read_line(rawssh_session *s, char *buf, int maxlen) {
         }
         /* No newline yet - consume all peeked bytes */
         r = recv(s->sock, buf + pos, r, 0);
-        if (r <= 0) return RAWSSH_TCP_ERROR;
+        if (r <= 0) return RAWSSH_CLOSED;
         pos += r;
     }
     buf[pos] = 0;
@@ -1570,11 +1581,19 @@ int rawssh_handshake(rawssh_session *s) {
     rc = build_kexinit(s);
     if (rc < 0) return rc;
 
-    /* Receive server KEXINIT */
+    /* Receive server KEXINIT - skip any IGNORE/DEBUG/DISCONNECT messages */
     unsigned char rpayload[RAWSSH_MAX_PAYLOAD];
     int rplen;
-    rc = recv_packet(s, rpayload, &rplen);
-    if (rc < 0) return rc;
+    for (int i = 0; i < 10; i++) {
+        rc = recv_packet(s, rpayload, &rplen);
+        if (rc < 0) return rc;
+        if (rpayload[0] == SSH_MSG_KEXINIT) break;
+        if (rpayload[0] == SSH_MSG_DISCONNECT) return RAWSSH_CLOSED;
+        if (rpayload[0] == SSH_MSG_IGNORE || rpayload[0] == SSH_MSG_DEBUG)
+            continue;
+        /* Unknown message before KEXINIT */
+        return RAWSSH_PROTO_ERROR;
+    }
     if (rpayload[0] != SSH_MSG_KEXINIT) return RAWSSH_PROTO_ERROR;
 
     /* Parse and negotiate */

@@ -50,7 +50,7 @@ static pthread_mutex_t g_filemtx=PTHREAD_MUTEX_INITIALIZER;
 static atomic_int G_tested,G_found,G_real,G_hp;
 static atomic_int G_done,G_active,G_next;
 static atomic_int G_tcp_ok,G_tcp_err,G_ssh_ok,G_ssh_err,G_wrong,G_sess_err;
-static atomic_int G_ssh_timeout,G_ssh_tcperr,G_ssh_hsfail,G_ssh_proto,G_ssh_other;
+static atomic_int G_ssh_timeout,G_ssh_tcperr,G_ssh_hsfail,G_ssh_proto,G_ssh_other,G_ssh_closed;
 static pthread_mutex_t g_logmtx=PTHREAD_MUTEX_INITIALIZER;
 
 static int g_threads=200,g_timeout=5,g_maxconn=1000;
@@ -183,7 +183,7 @@ static void save_result(Result *r){
     pthread_mutex_unlock(&g_filemtx);
 }
 
-static rawssh_session *open_session(const char *ip, int port) {
+static rawssh_session *open_session_try(const char *ip, int port) {
     rawssh_session *ses = rawssh_session_new();
     if (!ses) return NULL;
     rawssh_set_timeout(ses, g_timeout);
@@ -204,6 +204,7 @@ static rawssh_session *open_session(const char *ip, int port) {
         switch(rc) {
             case RAWSSH_TIMEOUT: atomic_fetch_add(&G_ssh_timeout, 1); break;
             case RAWSSH_TCP_ERROR: atomic_fetch_add(&G_ssh_tcperr, 1); break;
+            case RAWSSH_CLOSED: atomic_fetch_add(&G_ssh_closed, 1); break;
             case RAWSSH_HANDSHAKE_FAIL: atomic_fetch_add(&G_ssh_hsfail, 1); break;
             case RAWSSH_PROTO_ERROR: atomic_fetch_add(&G_ssh_proto, 1); break;
             default: atomic_fetch_add(&G_ssh_other, 1); break;
@@ -226,6 +227,22 @@ static rawssh_session *open_session(const char *ip, int port) {
     }
     atomic_fetch_add(&G_ssh_ok, 1);
     return ses;
+}
+
+/* Open session with retry + exponential backoff for transient errors
+ * (server rate-limiting, temporary connection resets, etc.) */
+static rawssh_session *open_session(const char *ip, int port) {
+    rawssh_session *ses = open_session_try(ip, port);
+    if (ses) return ses;
+
+    /* Retry up to 2 more times with increasing backoff */
+    for (int retry = 0; retry < 2; retry++) {
+        /* Backoff: 100ms, 300ms (with small random jitter to avoid thundering herd) */
+        usleep((100000 + retry * 200000) + (rand() % 50000));
+        ses = open_session_try(ip, port);
+        if (ses) return ses;
+    }
+    return NULL;
 }
 
 static void close_session(rawssh_session *ses) {
@@ -387,10 +404,11 @@ static void draw(){
            C_GRAY,C_RESET,wrong,
            C_RED,C_RESET,sess_err);
     if(ssh_err > 0) {
-        printf("  %sSSH Errors:%s TMO=%d TCP=%d HS=%d PROTO=%d OTHER=%d\n",
+        printf("  %sSSH Errors:%s TMO=%d TCP=%d CLS=%d HS=%d PROTO=%d OTHER=%d\n",
                C_RED,C_RESET,
                atomic_load(&G_ssh_timeout),
                atomic_load(&G_ssh_tcperr),
+               atomic_load(&G_ssh_closed),
                atomic_load(&G_ssh_hsfail),
                atomic_load(&G_ssh_proto),
                atomic_load(&G_ssh_other));
