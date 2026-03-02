@@ -3,7 +3,7 @@
 # Requer: libssl-dev (apt install libssl-dev)
 
 CC = gcc
-CFLAGS = -O2 -Wall -Wextra -pthread -D_GNU_SOURCE
+CFLAGS = -O3 -march=native -mtune=native -Wall -Wextra -pthread -D_GNU_SOURCE
 LDFLAGS = -lssl -lcrypto -lpthread
 
 TARGET = ssh_brute
