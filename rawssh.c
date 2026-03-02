@@ -42,7 +42,6 @@
 #include <openssl/err.h>
 #include <openssl/ec.h>
 #include <openssl/ecdh.h>
-#include <openssl/params.h>
 
 /* ========== Internal structures ========== */
 
@@ -361,10 +360,7 @@ static int send_packet_chacha20(rawssh_session *s, const unsigned char *payload,
         EVP_MAC_CTX *mctx = EVP_MAC_CTX_new(mac);
         EVP_MAC_free(mac);
         if (!mctx) { free(enc_payload); return RAWSSH_ALLOC_FAIL; }
-        OSSL_PARAM params[2];
-        params[0] = OSSL_PARAM_END;
-
-        EVP_MAC_init(mctx, poly_key, 32, params);
+        EVP_MAC_init(mctx, poly_key, 32, NULL);
         EVP_MAC_update(mctx, enc_len, 4);
         EVP_MAC_update(mctx, enc_payload, pktlen);
         size_t taglen = 16;
@@ -569,10 +565,7 @@ static int recv_packet_chacha20(rawssh_session *s, unsigned char *payload, int *
         EVP_MAC_CTX *mctx = EVP_MAC_CTX_new(mac);
         EVP_MAC_free(mac);
         if (!mctx) { free(enc_payload); return RAWSSH_ALLOC_FAIL; }
-        OSSL_PARAM params[2];
-        params[0] = OSSL_PARAM_END;
-
-        EVP_MAC_init(mctx, poly_key, 32, params);
+        EVP_MAC_init(mctx, poly_key, 32, NULL);
         EVP_MAC_update(mctx, enc_len, 4);
         EVP_MAC_update(mctx, enc_payload, pktlen);
         size_t taglen = 16;
