@@ -50,6 +50,8 @@ static pthread_mutex_t g_filemtx=PTHREAD_MUTEX_INITIALIZER;
 static atomic_int G_tested,G_found,G_real,G_hp;
 static atomic_int G_done,G_active,G_next;
 static atomic_int G_tcp_ok,G_tcp_err,G_ssh_ok,G_ssh_err,G_wrong,G_sess_err;
+static atomic_int G_ssh_timeout,G_ssh_tcperr,G_ssh_hsfail,G_ssh_proto,G_ssh_other;
+static pthread_mutex_t g_logmtx=PTHREAD_MUTEX_INITIALIZER;
 
 static int g_threads=200,g_timeout=5,g_maxconn=1000;
 static sem_t g_sem;
@@ -198,6 +200,26 @@ static rawssh_session *open_session(const char *ip, int port) {
     rc = rawssh_handshake(ses);
     if (rc != RAWSSH_OK) {
         atomic_fetch_add(&G_ssh_err, 1);
+        /* Track error types */
+        switch(rc) {
+            case RAWSSH_TIMEOUT: atomic_fetch_add(&G_ssh_timeout, 1); break;
+            case RAWSSH_TCP_ERROR: atomic_fetch_add(&G_ssh_tcperr, 1); break;
+            case RAWSSH_HANDSHAKE_FAIL: atomic_fetch_add(&G_ssh_hsfail, 1); break;
+            case RAWSSH_PROTO_ERROR: atomic_fetch_add(&G_ssh_proto, 1); break;
+            default: atomic_fetch_add(&G_ssh_other, 1); break;
+        }
+        /* Log first 500 errors to file for debugging */
+        int err_total = atomic_load(&G_ssh_err);
+        if (err_total <= 500) {
+            pthread_mutex_lock(&g_logmtx);
+            FILE *lf = fopen("ssh_errors.log", "a");
+            if (lf) {
+                fprintf(lf, "%s:%d handshake_fail rc=%d (%s)\n",
+                        ip, port, rc, rawssh_error_str(rc));
+                fclose(lf);
+            }
+            pthread_mutex_unlock(&g_logmtx);
+        }
         rawssh_disconnect(ses);
         rawssh_session_free(ses);
         return NULL;
@@ -359,11 +381,21 @@ static void draw(){
 
     int tcp_tot=tcp_ok+tcp_err;
     int ssh_tot=ssh_ok+ssh_err;
-    printf("  %sTCP:%s %d/%d (%.0f%% ok)  %sSSH:%s %d/%d (%.0f%% ok)  %sWrong:%s %d  %sSessErr:%s %d\n\n",
+    printf("  %sTCP:%s %d/%d (%.0f%% ok)  %sSSH:%s %d/%d (%.0f%% ok)  %sWrong:%s %d  %sSessErr:%s %d\n",
            C_GRAY,C_RESET,tcp_ok,tcp_tot,tcp_tot?(tcp_ok*100.0f/tcp_tot):0,
            C_GRAY,C_RESET,ssh_ok,ssh_tot,ssh_tot?(ssh_ok*100.0f/ssh_tot):0,
            C_GRAY,C_RESET,wrong,
            C_RED,C_RESET,sess_err);
+    if(ssh_err > 0) {
+        printf("  %sSSH Errors:%s TMO=%d TCP=%d HS=%d PROTO=%d OTHER=%d\n",
+               C_RED,C_RESET,
+               atomic_load(&G_ssh_timeout),
+               atomic_load(&G_ssh_tcperr),
+               atomic_load(&G_ssh_hsfail),
+               atomic_load(&G_ssh_proto),
+               atomic_load(&G_ssh_other));
+    }
+    printf("\n");
 
     pthread_mutex_lock(&g_resmtx);
     int st=(g_nresults>8)?g_nresults-8:0;

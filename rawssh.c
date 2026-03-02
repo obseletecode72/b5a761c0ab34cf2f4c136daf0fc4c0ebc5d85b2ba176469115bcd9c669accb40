@@ -751,7 +751,7 @@ static const EVP_MD *get_kex_md(rawssh_session *s) {
 
 #define KEX_LIST "curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256,diffie-hellman-group14-sha256,diffie-hellman-group16-sha512,diffie-hellman-group-exchange-sha256,diffie-hellman-group14-sha1"
 #define HOSTKEY_LIST "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-256,rsa-sha2-512,ssh-rsa"
-#define CIPHER_LIST "chacha20-poly1305@openssh.com,aes128-ctr,aes256-ctr"
+#define CIPHER_LIST "aes128-ctr,aes256-ctr,chacha20-poly1305@openssh.com"
 #define MAC_LIST "hmac-sha2-256,hmac-sha1"
 
 /* Build KEXINIT packet */
