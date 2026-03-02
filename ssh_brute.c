@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,7 +8,15 @@
 #include <pthread.h>
 #include <errno.h>
 #include <signal.h>
+#if defined(__GNUC__) && (__GNUC__ < 5) && !defined(__clang__)
+#define atomic_int volatile int
+#define atomic_fetch_add(ptr, val) __atomic_fetch_add((ptr), (val), __ATOMIC_SEQ_CST)
+#define atomic_fetch_sub(ptr, val) __atomic_fetch_sub((ptr), (val), __ATOMIC_SEQ_CST)
+#define atomic_load(ptr) __atomic_load_n((ptr), __ATOMIC_SEQ_CST)
+#define atomic_store(ptr, val) __atomic_store_n((ptr), (val), __ATOMIC_SEQ_CST)
+#else
 #include <stdatomic.h>
+#endif
 #include <time.h>
 #include <ctype.h>
 #include <sys/resource.h>
