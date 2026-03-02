@@ -81,6 +81,7 @@ struct rawssh_session {
     uint32_t next_channel_id;
     uint32_t last_disconnect_reason;
     char disconnect_msg[128];
+    char cipher_name[64];
 };
 
 struct rawssh_channel {
@@ -1038,6 +1039,8 @@ static int parse_kexinit(rawssh_session *s, const unsigned char *payload, int pl
     }
 
     s->handshake_step = 3;
+    snprintf(s->cipher_name, sizeof(s->cipher_name), "%s/%s/%s",
+             chosen_kex, chosen_cipher_c2s, chosen_mac_c2s);
     return RAWSSH_OK;
 }
 
@@ -1668,7 +1671,7 @@ int rawssh_connect(rawssh_session *s, const char *host, int port) {
     setsockopt(s->sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(s->sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-    struct linger lg = {1, 2};
+    struct linger lg = {1, 0};
     setsockopt(s->sock, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
 
     setsockopt(s->sock, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
@@ -1997,4 +2000,8 @@ uint32_t rawssh_disconnect_reason(rawssh_session *s) {
 
 const char *rawssh_disconnect_msg(rawssh_session *s) {
     return (s && s->disconnect_msg[0]) ? s->disconnect_msg : "";
+}
+
+const char *rawssh_cipher_info(rawssh_session *s) {
+    return (s && s->cipher_name[0]) ? s->cipher_name : "unknown";
 }
