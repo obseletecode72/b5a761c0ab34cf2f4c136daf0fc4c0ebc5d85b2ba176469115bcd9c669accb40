@@ -183,7 +183,7 @@ static void save_result(Result *r){
     pthread_mutex_unlock(&g_filemtx);
 }
 
-static rawssh_session *open_session_try(const char *ip, int port) {
+static rawssh_session *open_session(const char *ip, int port) {
     rawssh_session *ses = rawssh_session_new();
     if (!ses) return NULL;
     rawssh_set_timeout(ses, g_timeout);
@@ -229,22 +229,6 @@ static rawssh_session *open_session_try(const char *ip, int port) {
     return ses;
 }
 
-/* Open session with retry + exponential backoff for transient errors
- * (server rate-limiting, temporary connection resets, etc.) */
-static rawssh_session *open_session(const char *ip, int port) {
-    rawssh_session *ses = open_session_try(ip, port);
-    if (ses) return ses;
-
-    /* Retry up to 2 more times with increasing backoff */
-    for (int retry = 0; retry < 2; retry++) {
-        /* Backoff: 100ms, 300ms (with small random jitter to avoid thundering herd) */
-        usleep((100000 + retry * 200000) + (rand() % 50000));
-        ses = open_session_try(ip, port);
-        if (ses) return ses;
-    }
-    return NULL;
-}
-
 static void close_session(rawssh_session *ses) {
     if (!ses) return;
     rawssh_disconnect(ses);
@@ -280,10 +264,11 @@ static void process(int idx) {
         /* Preemptive reconnect before server kicks us */
         if (auth_count >= AUTH_PER_CONN) {
             close_session(ses);
+            usleep(50000 + (rand() % 50000)); /* 50-100ms backoff between reconnects */
             ses = open_session(t->ip, t->port);
             if (!ses) {
-                /* Retry once after brief backoff */
-                usleep(50000);
+                /* Retry once after longer backoff */
+                usleep(200000);
                 ses = open_session(t->ip, t->port);
                 if (!ses) {
                     sem_post(&g_sem);
@@ -334,7 +319,8 @@ static void process(int idx) {
         ses = NULL;
 
         if (rc == RAWSSH_CLOSED) {
-            /* Server disconnect (e.g. MaxAuthTries) - just reconnect */
+            /* Server disconnect (e.g. MaxAuthTries) - reconnect with backoff */
+            usleep(100000 + (rand() % 100000)); /* 100-200ms backoff */
             ses = open_session(t->ip, t->port);
             if (!ses) {
                 sem_post(&g_sem);
@@ -353,6 +339,7 @@ static void process(int idx) {
             goto done;
         }
 
+        usleep(200000); /* 200ms backoff before retry */
         ses = open_session(t->ip, t->port);
         if (!ses) {
             sem_post(&g_sem);

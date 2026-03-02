@@ -703,11 +703,30 @@ static int recv_packet_encrypted(rawssh_session *s, unsigned char *payload, int 
     return RAWSSH_OK;
 }
 
-static int recv_packet(rawssh_session *s, unsigned char *payload, int *plen) {
+static int recv_packet_raw(rawssh_session *s, unsigned char *payload, int *plen) {
     if (s->encrypted)
         return recv_packet_encrypted(s, payload, plen);
     else
         return recv_packet_plain(s, payload, plen);
+}
+
+/* Wrapper: auto-handle DISCONNECT, IGNORE, DEBUG per RFC 4253 §11
+ * These messages can arrive at any time and must be handled transparently. */
+static int recv_packet(rawssh_session *s, unsigned char *payload, int *plen) {
+    for (int i = 0; i < 20; i++) {
+        int rc = recv_packet_raw(s, payload, plen);
+        if (rc < 0) return rc;
+        /* Server is disconnecting us */
+        if (payload[0] == SSH_MSG_DISCONNECT) return RAWSSH_CLOSED;
+        /* Skip debug/ignore messages - servers send these any time */
+        if (payload[0] == SSH_MSG_IGNORE || payload[0] == SSH_MSG_DEBUG)
+            continue;
+        /* SSH_MSG_UNIMPLEMENTED - skip but note it */
+        if (payload[0] == SSH_MSG_UNIMPLEMENTED)
+            continue;
+        return rc;
+    }
+    return RAWSSH_PROTO_ERROR; /* too many ignored messages */
 }
 
 /* ========== Key Exchange ========== */
@@ -1416,9 +1435,8 @@ static int request_service(rawssh_session *s, const char *service) {
     rc = recv_packet(s, rpayload, &rplen);
     if (rc < 0) return rc;
 
-    /* Accept SSH_MSG_SERVICE_ACCEPT or SSH_MSG_USERAUTH_BANNER */
-    while (rpayload[0] == SSH_MSG_DEBUG || rpayload[0] == SSH_MSG_IGNORE ||
-           rpayload[0] == SSH_MSG_USERAUTH_BANNER) {
+    /* Accept SSH_MSG_SERVICE_ACCEPT - skip any banners */
+    while (rpayload[0] == SSH_MSG_USERAUTH_BANNER) {
         rc = recv_packet(s, rpayload, &rplen);
         if (rc < 0) return rc;
     }
@@ -1581,19 +1599,11 @@ int rawssh_handshake(rawssh_session *s) {
     rc = build_kexinit(s);
     if (rc < 0) return rc;
 
-    /* Receive server KEXINIT - skip any IGNORE/DEBUG/DISCONNECT messages */
+    /* Receive server KEXINIT */
     unsigned char rpayload[RAWSSH_MAX_PAYLOAD];
     int rplen;
-    for (int i = 0; i < 10; i++) {
-        rc = recv_packet(s, rpayload, &rplen);
-        if (rc < 0) return rc;
-        if (rpayload[0] == SSH_MSG_KEXINIT) break;
-        if (rpayload[0] == SSH_MSG_DISCONNECT) return RAWSSH_CLOSED;
-        if (rpayload[0] == SSH_MSG_IGNORE || rpayload[0] == SSH_MSG_DEBUG)
-            continue;
-        /* Unknown message before KEXINIT */
-        return RAWSSH_PROTO_ERROR;
-    }
+    rc = recv_packet(s, rpayload, &rplen);
+    if (rc < 0) return rc;
     if (rpayload[0] != SSH_MSG_KEXINIT) return RAWSSH_PROTO_ERROR;
 
     /* Parse and negotiate */
@@ -1649,13 +1659,8 @@ int rawssh_auth_password(rawssh_session *s, const char *user, const char *pass) 
         if (rpayload[0] == SSH_MSG_USERAUTH_FAILURE) {
             return RAWSSH_AUTH_FAIL;
         }
-        if (rpayload[0] == SSH_MSG_USERAUTH_BANNER ||
-            rpayload[0] == SSH_MSG_DEBUG ||
-            rpayload[0] == SSH_MSG_IGNORE) {
-            continue;
-        }
-        if (rpayload[0] == SSH_MSG_DISCONNECT) {
-            return RAWSSH_CLOSED;
+        if (rpayload[0] == SSH_MSG_USERAUTH_BANNER) {
+            continue; /* skip banner, try next message */
         }
         /* Unknown message - skip */
     }
