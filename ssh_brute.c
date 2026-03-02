@@ -499,9 +499,17 @@ static rawssh_session *open_session(const char *ip, int port) {
             pthread_mutex_lock(&g_logmtx);
             FILE *lf = fopen("ssh_errors.log", "a");
             if (lf) {
-                fprintf(lf, "%s:%d handshake_fail rc=%d (%s) step=%s\n",
-                        ip, port, rc, rawssh_error_str(rc),
-                        rawssh_handshake_step_str(ses));
+                uint32_t dr = rawssh_disconnect_reason(ses);
+                const char *dm = rawssh_disconnect_msg(ses);
+                if (dr || (dm && dm[0])) {
+                    fprintf(lf, "%s:%d handshake_fail rc=%d (%s) step=%s disc_reason=%u disc_msg=%s\n",
+                            ip, port, rc, rawssh_error_str(rc),
+                            rawssh_handshake_step_str(ses), dr, dm);
+                } else {
+                    fprintf(lf, "%s:%d handshake_fail rc=%d (%s) step=%s\n",
+                            ip, port, rc, rawssh_error_str(rc),
+                            rawssh_handshake_step_str(ses));
+                }
                 fclose(lf);
             }
             pthread_mutex_unlock(&g_logmtx);
@@ -529,7 +537,14 @@ static void process(int idx) {
 
     sem_wait(&g_sem);
 
-    rawssh_session *ses = open_session(t->ip, t->port);
+    /* Initial connection with retry + backoff */
+    rawssh_session *ses = NULL;
+    for (int retry = 0; retry < 3; retry++) {
+        ses = open_session(t->ip, t->port);
+        if (ses) break;
+        if (retry < 2)
+            usleep((200000 << retry) + (rand_r(&rng_seed) % 100000));
+    }
     if (!ses) {
         sem_post(&g_sem);
         goto done;
@@ -543,15 +558,17 @@ static void process(int idx) {
     while (combo < total) {
         if (auth_count >= AUTH_PER_CONN) {
             close_session(ses);
+            ses = NULL;
             usleep(10000 + (rand_r(&rng_seed) % 20000));
-            ses = open_session(t->ip, t->port);
-            if (!ses) {
-                usleep(50000);
+            /* Retry reconnection with backoff */
+            for (int retry = 0; retry < 3; retry++) {
                 ses = open_session(t->ip, t->port);
-                if (!ses) {
-                    sem_post(&g_sem);
-                    goto done;
-                }
+                if (ses) break;
+                usleep((100000 << retry) + (rand_r(&rng_seed) % 50000));
+            }
+            if (!ses) {
+                sem_post(&g_sem);
+                goto done;
             }
             auth_count = 0;
         }
@@ -595,8 +612,12 @@ static void process(int idx) {
         ses = NULL;
 
         if (rc == RAWSSH_CLOSED) {
-            usleep(20000 + (rand_r(&rng_seed) % 30000));
-            ses = open_session(t->ip, t->port);
+            /* Server closed - retry with backoff */
+            for (int retry = 0; retry < 2; retry++) {
+                usleep((50000 << retry) + (rand_r(&rng_seed) % 50000));
+                ses = open_session(t->ip, t->port);
+                if (ses) break;
+            }
             if (!ses) {
                 sem_post(&g_sem);
                 goto done;
@@ -611,7 +632,7 @@ static void process(int idx) {
             goto done;
         }
 
-        usleep(50000);
+        usleep(100000 + (rand_r(&rng_seed) % 100000));
         ses = open_session(t->ip, t->port);
         if (!ses) {
             sem_post(&g_sem);

@@ -79,6 +79,8 @@ struct rawssh_session {
     int authenticated;
     int handshake_step;
     uint32_t next_channel_id;
+    uint32_t last_disconnect_reason;
+    char disconnect_msg[128];
 };
 
 struct rawssh_channel {
@@ -757,7 +759,21 @@ static int recv_packet(rawssh_session *s, unsigned char *payload, int *plen) {
     for (int i = 0; i < 20; i++) {
         int rc = recv_packet_raw(s, payload, plen);
         if (rc < 0) return rc;
-        if (payload[0] == SSH_MSG_DISCONNECT) return RAWSSH_CLOSED;
+        if (payload[0] == SSH_MSG_DISCONNECT) {
+            if (*plen >= 5) {
+                s->last_disconnect_reason = get_u32(payload + 1);
+                if (*plen > 9) {
+                    int doff = 5;
+                    const unsigned char *msg_data; uint32_t msg_len;
+                    if (get_string(payload, *plen, &doff, &msg_data, &msg_len) >= 0 && msg_len > 0) {
+                        int cpy = (int)msg_len < 127 ? (int)msg_len : 127;
+                        memcpy(s->disconnect_msg, msg_data, cpy);
+                        s->disconnect_msg[cpy] = 0;
+                    }
+                }
+            }
+            return RAWSSH_CLOSED;
+        }
         if (payload[0] == SSH_MSG_IGNORE || payload[0] == SSH_MSG_DEBUG)
             continue;
         if (payload[0] == SSH_MSG_UNIMPLEMENTED)
@@ -1652,7 +1668,7 @@ int rawssh_connect(rawssh_session *s, const char *host, int port) {
     setsockopt(s->sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(s->sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-    struct linger lg = {1, 0};
+    struct linger lg = {1, 2};
     setsockopt(s->sock, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
 
     setsockopt(s->sock, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
@@ -1973,4 +1989,12 @@ const char *rawssh_handshake_step_str(rawssh_session *s) {
         case 35: return "negotiate_mac_s2c";
         default: return "unknown";
     }
+}
+
+uint32_t rawssh_disconnect_reason(rawssh_session *s) {
+    return s ? s->last_disconnect_reason : 0;
+}
+
+const char *rawssh_disconnect_msg(rawssh_session *s) {
+    return (s && s->disconnect_msg[0]) ? s->disconnect_msg : "";
 }
