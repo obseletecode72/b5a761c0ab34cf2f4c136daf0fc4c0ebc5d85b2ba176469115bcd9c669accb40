@@ -3,8 +3,8 @@
 # Requer: libssl-dev (apt install libssl-dev)
 
 CC = gcc
-CFLAGS = -O3 -march=native -mtune=native -Wall -Wextra -pthread -D_GNU_SOURCE
-LDFLAGS = -lssl -lcrypto -lpthread
+CFLAGS = -std=c11 -O3 -march=native -mtune=native -Wall -Wextra -pthread -D_GNU_SOURCE -I/opt/openssl3/include
+LDFLAGS = -L/opt/openssl3/lib64 -lssl -lcrypto -lpthread -Wl,-rpath=/opt/openssl3/lib64
 
 TARGET = ssh_brute
 OBJS = rawssh.o ssh_brute.o

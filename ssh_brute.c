@@ -553,10 +553,8 @@ static void process(int idx) {
     while (combo < total) {
         if (auth_count >= AUTH_PER_CONN) {
             close_session(ses);
-            usleep(50000 + (rand_r(&rng_seed) % 50000));
             ses = open_session(t->ip, t->port);
             if (!ses) {
-                usleep(200000);
                 ses = open_session(t->ip, t->port);
                 if (!ses) {
                     sem_post(&g_sem);
@@ -605,7 +603,6 @@ static void process(int idx) {
         ses = NULL;
 
         if (rc == RAWSSH_CLOSED) {
-            usleep(100000 + (rand_r(&rng_seed) % 100000));
             ses = open_session(t->ip, t->port);
             if (!ses) {
                 sem_post(&g_sem);
@@ -616,12 +613,11 @@ static void process(int idx) {
         }
 
         atomic_fetch_add(&G_sess_err, 1);
-        if (++errs >= 5) {
+        if (++errs >= 3) {
             sem_post(&g_sem);
             goto done;
         }
 
-        usleep(200000);
         ses = open_session(t->ip, t->port);
         if (!ses) {
             sem_post(&g_sem);
