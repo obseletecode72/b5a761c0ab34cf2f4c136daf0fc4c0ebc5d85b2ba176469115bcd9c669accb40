@@ -215,8 +215,9 @@ static rawssh_session *open_session(const char *ip, int port) {
             pthread_mutex_lock(&g_logmtx);
             FILE *lf = fopen("ssh_errors.log", "a");
             if (lf) {
-                fprintf(lf, "%s:%d handshake_fail rc=%d (%s)\n",
-                        ip, port, rc, rawssh_error_str(rc));
+                fprintf(lf, "%s:%d handshake_fail rc=%d (%s) step=%s\n",
+                        ip, port, rc, rawssh_error_str(rc),
+                        rawssh_handshake_step_str(ses));
                 fclose(lf);
             }
             pthread_mutex_unlock(&g_logmtx);
@@ -455,7 +456,7 @@ int main(int argc,char **argv){
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr,64*1024); /* 64KB per thread - sufficient for process() */
+    pthread_attr_setstacksize(&attr,128*1024); /* 128KB per thread - handles larger algo negotiation buffers */
 
     pthread_t panel;
     pthread_create(&panel,NULL,panel_fn,NULL);

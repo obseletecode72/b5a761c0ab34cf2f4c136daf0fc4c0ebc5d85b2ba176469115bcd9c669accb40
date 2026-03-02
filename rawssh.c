@@ -102,6 +102,9 @@ struct rawssh_session {
     /* Authenticated flag */
     int authenticated;
 
+    /* Debug: which handshake step failed */
+    int handshake_step; /* 0=version, 1=kexinit_send, 2=kexinit_recv, 3=negotiate, 4=kex, 5=newkeys, 6=service */
+
     /* Channel counter */
     uint32_t next_channel_id;
 };
@@ -859,12 +862,12 @@ static int parse_kexinit(rawssh_session *s, const unsigned char *payload, int pl
     /* Parse name-lists */
     const unsigned char *data;
     uint32_t dlen;
-    char server_kex[256] = {0};
-    char server_hostkey[256] = {0};
-    char server_enc_c2s[256] = {0};
-    char server_enc_s2c[256] = {0};
-    char server_mac_c2s[256] = {0};
-    char server_mac_s2c[256] = {0};
+    char server_kex[1024] = {0};
+    char server_hostkey[1024] = {0};
+    char server_enc_c2s[1024] = {0};
+    char server_enc_s2c[1024] = {0};
+    char server_mac_c2s[1024] = {0};
+    char server_mac_s2c[1024] = {0};
 
     /* kex_algorithms */
     if (get_string(payload, plen, &off, &data, &dlen) < 0) return RAWSSH_PROTO_ERROR;
@@ -1086,6 +1089,7 @@ static int compute_exchange_hash_ecdh(rawssh_session *s,
 
 /* Complete KEX: NEWKEYS exchange + key derivation (shared by all KEX types) */
 static int complete_kex(rawssh_session *s) {
+    s->handshake_step = 5; /* newkeys */
     unsigned char nk = SSH_MSG_NEWKEYS;
     int rc = send_packet(s, &nk, 1);
     if (rc < 0) return rc;
@@ -1621,6 +1625,7 @@ int rawssh_connect(rawssh_session *s, const char *host, int port) {
 
 int rawssh_handshake(rawssh_session *s) {
     /* Send our version string */
+    s->handshake_step = 0; /* version exchange */
     char ver[128];
     int vlen = snprintf(ver, sizeof(ver), "%s\r\n", s->client_version);
     int rc = raw_send(s, ver, vlen);
@@ -1637,10 +1642,12 @@ int rawssh_handshake(rawssh_session *s) {
         return RAWSSH_PROTO_ERROR;
 
     /* Send KEXINIT */
+    s->handshake_step = 1; /* kexinit send */
     rc = build_kexinit(s);
     if (rc < 0) return rc;
 
     /* Receive server KEXINIT */
+    s->handshake_step = 2; /* kexinit recv */
     unsigned char rpayload[RAWSSH_MAX_PAYLOAD];
     int rplen;
     rc = recv_packet(s, rpayload, &rplen);
@@ -1648,10 +1655,12 @@ int rawssh_handshake(rawssh_session *s) {
     if (rpayload[0] != SSH_MSG_KEXINIT) return RAWSSH_PROTO_ERROR;
 
     /* Parse and negotiate */
+    s->handshake_step = 3; /* negotiate */
     rc = parse_kexinit(s, rpayload, rplen);
     if (rc < 0) return rc;
 
     /* Perform key exchange based on negotiated algorithm */
+    s->handshake_step = 4; /* kex */
     switch (s->kex_type) {
         case 2: rc = do_kex_curve25519(s); break;
         case 3: rc = do_kex_ecdh_p256(s); break;
@@ -1661,6 +1670,7 @@ int rawssh_handshake(rawssh_session *s) {
     if (rc < 0) return rc;
 
     /* Request ssh-userauth service */
+    s->handshake_step = 6; /* service */
     rc = request_service(s, "ssh-userauth");
     if (rc < 0) return rc;
 
@@ -1917,4 +1927,22 @@ const char *rawssh_error_str(int err) {
 
 int rawssh_get_sock(rawssh_session *s) {
     return s ? s->sock : -1;
+}
+
+int rawssh_handshake_step(rawssh_session *s) {
+    return s ? s->handshake_step : -1;
+}
+
+const char *rawssh_handshake_step_str(rawssh_session *s) {
+    if (!s) return "null";
+    switch (s->handshake_step) {
+        case 0: return "version";
+        case 1: return "kexinit_send";
+        case 2: return "kexinit_recv";
+        case 3: return "negotiate";
+        case 4: return "kex";
+        case 5: return "newkeys";
+        case 6: return "service";
+        default: return "unknown";
+    }
 }
