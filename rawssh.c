@@ -6,10 +6,10 @@
  *
  * Algoritmos suportados:
  *   KEX: curve25519-sha256, ecdh-sha2-nistp256, diffie-hellman-group14/16,
- *        diffie-hellman-group-exchange-sha256
- *   Host key: ssh-ed25519, ecdsa-sha2-nistp*, rsa-sha2-*, ssh-rsa
- *   Cipher: chacha20-poly1305@openssh.com, aes128-ctr, aes256-ctr
- *   MAC: hmac-sha2-256, hmac-sha1 (implicit with chacha20-poly1305)
+ *        diffie-hellman-group-exchange-sha256, diffie-hellman-group1-sha1
+ *   Host key: ssh-ed25519, ecdsa-sha2-nistp*, rsa-sha2-*, ssh-rsa, ssh-dss
+ *   Cipher: chacha20-poly1305@openssh.com, aes128/256-ctr, aes128/256-cbc, 3des-cbc
+ *   MAC: hmac-sha2-256, hmac-sha1, hmac-md5 (implicit with chacha20-poly1305)
  *   Compression: none
  */
 
@@ -91,11 +91,13 @@ struct rawssh_session {
     int encrypted;
 
     /* KEX algorithm selection */
-    int kex_type;       /* 0=dh-group14, 1=dh-group16, 2=curve25519, 3=ecdh-p256, 4=dh-gex-sha256 */
+    int kex_type;       /* 0=dh-group14, 1=dh-group16, 2=curve25519, 3=ecdh-p256, 4=dh-gex-sha256, 5=dh-group1 */
     int kex_hash_type;  /* 0=sha1, 1=sha256, 2=sha512 */
-    int cipher_key_len; /* 16 or 32 (64 for chacha20-poly1305) */
-    int mac_is_sha256;  /* independent from kex hash */
+    int cipher_key_len; /* 16, 24 or 32 (64 for chacha20-poly1305) */
+    int mac_type;       /* 0=hmac-sha1(20), 1=hmac-sha2-256(32), 2=hmac-md5(16) */
     int is_chacha20;    /* 1 if using chacha20-poly1305@openssh.com */
+    int is_cbc;         /* 1 if using CBC mode cipher */
+    int is_3des;        /* 1 if using 3des-cbc */
 
     /* Authenticated flag */
     int authenticated;
@@ -419,8 +421,10 @@ static int send_packet_encrypted(rawssh_session *s, const unsigned char *payload
         unsigned int hmac_len = 0;
         HMAC_CTX *hctx = HMAC_CTX_new();
         if (!hctx) { if (plain != _sb_plain) free(plain); return RAWSSH_ALLOC_FAIL; }
-        if (s->c2s.mac_len >= 32) {
+        if (s->mac_type == 1) {
             HMAC_Init_ex(hctx, s->c2s.mac_key, 32, EVP_sha256(), NULL);
+        } else if (s->mac_type == 2) {
+            HMAC_Init_ex(hctx, s->c2s.mac_key, 16, EVP_md5(), NULL);
         } else {
             HMAC_Init_ex(hctx, s->c2s.mac_key, 20, EVP_sha1(), NULL);
         }
@@ -664,8 +668,10 @@ static int recv_packet_encrypted(rawssh_session *s, unsigned char *payload, int 
         unsigned int hmac_len = 0;
         HMAC_CTX *hctx = HMAC_CTX_new();
         if (!hctx) { if (full_dec != _sb_dec) free(full_dec); return RAWSSH_ALLOC_FAIL; }
-        if (s->s2c.mac_len >= 32) {
+        if (s->mac_type == 1) {
             HMAC_Init_ex(hctx, s->s2c.mac_key, 32, EVP_sha256(), NULL);
+        } else if (s->mac_type == 2) {
+            HMAC_Init_ex(hctx, s->s2c.mac_key, 16, EVP_md5(), NULL);
         } else {
             HMAC_Init_ex(hctx, s->s2c.mac_key, 20, EVP_sha1(), NULL);
         }
@@ -722,6 +728,17 @@ static int recv_packet(rawssh_session *s, unsigned char *payload, int *plen) {
 
 /* ========== Key Exchange ========== */
 
+/* RFC 2409 - Group 1 (Oakley Group 2, 1024-bit MODP) - legacy */
+static const char *dh_group1_p_hex =
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
+    "29024E088A67CC74020BBEA63B139B22514A08798E3404DD"
+    "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245"
+    "E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED"
+    "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3D"
+    "C2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F"
+    "83655D23DCA3AD961C62F356208552BB9ED529077096966D"
+    "670C354E4ABC9804F1746C08CA237327FFFFFFFFFFFFFFFF";
+
 /* RFC 3526 - Group 14 (2048-bit MODP) */
 static const char *dh_group14_p_hex =
     "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
@@ -770,10 +787,10 @@ static const EVP_MD *get_kex_md(rawssh_session *s) {
     }
 }
 
-#define KEX_LIST "curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256,diffie-hellman-group14-sha256,diffie-hellman-group16-sha512,diffie-hellman-group-exchange-sha256,diffie-hellman-group14-sha1"
-#define HOSTKEY_LIST "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-256,rsa-sha2-512,ssh-rsa"
-#define CIPHER_LIST "aes128-ctr,aes256-ctr,chacha20-poly1305@openssh.com"
-#define MAC_LIST "hmac-sha2-256,hmac-sha1"
+#define KEX_LIST "curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256,diffie-hellman-group14-sha256,diffie-hellman-group16-sha512,diffie-hellman-group-exchange-sha256,diffie-hellman-group14-sha1,diffie-hellman-group1-sha1"
+#define HOSTKEY_LIST "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-256,rsa-sha2-512,ssh-rsa,ssh-dss"
+#define CIPHER_LIST "aes128-ctr,aes256-ctr,chacha20-poly1305@openssh.com,aes128-cbc,aes256-cbc,3des-cbc"
+#define MAC_LIST "hmac-sha2-256,hmac-sha1,hmac-md5"
 
 /* Build KEXINIT packet */
 static int build_kexinit(rawssh_session *s) {
@@ -891,8 +908,10 @@ static int parse_kexinit(rawssh_session *s, const unsigned char *payload, int pl
         s->kex_type = 1; s->kex_hash_type = 2; /* sha512 */
     } else if (strstr(chosen_kex, "group14-sha256")) {
         s->kex_type = 0; s->kex_hash_type = 1;
+    } else if (strstr(chosen_kex, "group1-sha1")) {
+        s->kex_type = 5; s->kex_hash_type = 0; /* group1, sha1 */
     } else {
-        s->kex_type = 0; s->kex_hash_type = 0; /* sha1 */
+        s->kex_type = 0; s->kex_hash_type = 0; /* group14-sha1 */
     }
 
     if (find_match(HOSTKEY_LIST, server_hostkey, chosen_hostkey, sizeof(chosen_hostkey)) < 0)
@@ -904,13 +923,21 @@ static int parse_kexinit(rawssh_session *s, const unsigned char *payload, int pl
         return RAWSSH_PROTO_ERROR;
 
     /* Check for chacha20-poly1305@openssh.com */
+    s->is_cbc = 0;
+    s->is_3des = 0;
     if (strstr(chosen_cipher_c2s, "chacha20-poly1305")) {
         s->is_chacha20 = 1;
         s->cipher_key_len = 64; /* 2x32 bytes: main key + header key */
+    } else if (strstr(chosen_cipher_c2s, "3des-cbc")) {
+        s->cipher_key_len = 24; /* 3DES uses 24-byte key */
+        s->is_cbc = 1;
+        s->is_3des = 1;
     } else if (strstr(chosen_cipher_c2s, "aes256")) {
         s->cipher_key_len = 32;
+        if (strstr(chosen_cipher_c2s, "cbc")) s->is_cbc = 1;
     } else {
         s->cipher_key_len = 16;
+        if (strstr(chosen_cipher_c2s, "cbc")) s->is_cbc = 1;
     }
 
     /* For chacha20-poly1305, MAC is built into the cipher - no separate MAC needed */
@@ -918,13 +945,18 @@ static int parse_kexinit(rawssh_session *s, const unsigned char *payload, int pl
         /* Try to negotiate MAC but don't fail if server doesn't offer any we support */
         find_match(MAC_LIST, server_mac_c2s, chosen_mac_c2s, sizeof(chosen_mac_c2s));
         find_match(MAC_LIST, server_mac_s2c, chosen_mac_s2c, sizeof(chosen_mac_s2c));
-        s->mac_is_sha256 = 0; /* unused with chacha20-poly1305 */
+        s->mac_type = 0; /* unused with chacha20-poly1305 */
     } else {
         if (find_match(MAC_LIST, server_mac_c2s, chosen_mac_c2s, sizeof(chosen_mac_c2s)) < 0)
             return RAWSSH_PROTO_ERROR;
         if (find_match(MAC_LIST, server_mac_s2c, chosen_mac_s2c, sizeof(chosen_mac_s2c)) < 0)
             return RAWSSH_PROTO_ERROR;
-        s->mac_is_sha256 = (strstr(chosen_mac_c2s, "sha2-256") != NULL);
+        if (strstr(chosen_mac_c2s, "sha2-256"))
+            s->mac_type = 1; /* hmac-sha2-256, 32 bytes */
+        else if (strstr(chosen_mac_c2s, "md5"))
+            s->mac_type = 2; /* hmac-md5, 16 bytes */
+        else
+            s->mac_type = 0; /* hmac-sha1, 20 bytes */
     }
 
     return RAWSSH_OK;
@@ -1093,17 +1125,31 @@ static int complete_kex(rawssh_session *s) {
         s->s2c.mac_len = 0;
     } else {
         int kl = s->cipher_key_len;
-        int bl = 16;
-        int mac_kl = s->mac_is_sha256 ? 32 : 20;
+        int bl = s->is_3des ? 8 : 16; /* 3DES has 8-byte blocks, AES has 16 */
+        int iv_len = bl; /* IV length = block size */
+        int mac_kl;
+        switch (s->mac_type) {
+            case 1:  mac_kl = 32; break; /* hmac-sha2-256 */
+            case 2:  mac_kl = 16; break; /* hmac-md5 */
+            default: mac_kl = 20; break; /* hmac-sha1 */
+        }
 
-        derive_key(s, 'A', bl, s->c2s.iv);
-        derive_key(s, 'B', bl, s->s2c.iv);
+        derive_key(s, 'A', iv_len, s->c2s.iv);
+        derive_key(s, 'B', iv_len, s->s2c.iv);
         derive_key(s, 'C', kl, s->c2s.key);
         derive_key(s, 'D', kl, s->s2c.key);
         derive_key(s, 'E', mac_kl, s->c2s.mac_key);
         derive_key(s, 'F', mac_kl, s->s2c.mac_key);
 
-        const EVP_CIPHER *cipher = (kl == 32) ? EVP_aes_256_ctr() : EVP_aes_128_ctr();
+        /* Select cipher based on key length and mode */
+        const EVP_CIPHER *cipher;
+        if (s->is_3des) {
+            cipher = EVP_des_ede3_cbc();
+        } else if (s->is_cbc) {
+            cipher = (kl == 32) ? EVP_aes_256_cbc() : EVP_aes_128_cbc();
+        } else {
+            cipher = (kl == 32) ? EVP_aes_256_ctr() : EVP_aes_128_ctr();
+        }
 
         s->c2s.ctx = EVP_CIPHER_CTX_new();
         EVP_EncryptInit_ex(s->c2s.ctx, cipher, NULL, s->c2s.key, s->c2s.iv);
@@ -1124,13 +1170,15 @@ static int complete_kex(rawssh_session *s) {
     return RAWSSH_OK;
 }
 
-/* ========== KEX: DH group14/group16 ========== */
+/* ========== KEX: DH group1/group14/group16 ========== */
 static int do_kex_dh(rawssh_session *s) {
     s->dh_p = BN_new(); s->dh_g = BN_new();
     s->dh_x = BN_new(); s->dh_e = BN_new();
 
     if (s->kex_type == 1) /* group16 */
         BN_hex2bn(&s->dh_p, dh_group16_p_hex);
+    else if (s->kex_type == 5) /* group1 (legacy 1024-bit) */
+        BN_hex2bn(&s->dh_p, dh_group1_p_hex);
     else
         BN_hex2bn(&s->dh_p, dh_group14_p_hex);
     BN_set_word(s->dh_g, 2);
@@ -1608,7 +1656,7 @@ int rawssh_handshake(rawssh_session *s) {
         case 2: rc = do_kex_curve25519(s); break;
         case 3: rc = do_kex_ecdh_p256(s); break;
         case 4: rc = do_kex_dh_gex(s); break; /* group-exchange-sha256 */
-        default: rc = do_kex_dh(s); break; /* group14 or group16 */
+        default: rc = do_kex_dh(s); break; /* group1, group14, or group16 */
     }
     if (rc < 0) return rc;
 
