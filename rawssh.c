@@ -1,18 +1,3 @@
-/*
- * rawssh.c - Biblioteca SSH2 propria, thread-safe, alta performance
- * Implementa RFC 4253/4252/4254 sobre TCP com OpenSSL
- * Cada sessao e 100% independente - zero estado global compartilhado
- * Suporte a bind direto na NIC (SO_BINDTODEVICE)
- *
- * Algoritmos suportados:
- *   KEX: curve25519-sha256, ecdh-sha2-nistp256, diffie-hellman-group14/16,
- *        diffie-hellman-group-exchange-sha256, diffie-hellman-group1-sha1
- *   Host key: ssh-ed25519, ecdsa-sha2-nistp*, rsa-sha2-*, ssh-rsa, ssh-dss
- *   Cipher: chacha20-poly1305@openssh.com, aes128/256-ctr, aes128/256-cbc, 3des-cbc
- *   MAC: hmac-sha2-256, hmac-sha1, hmac-md5 (implicit with chacha20-poly1305)
- *   Compression: none
- */
-
 #define _GNU_SOURCE
 #include "rawssh.h"
 
@@ -43,14 +28,11 @@
 #include <openssl/ec.h>
 #include <openssl/ecdh.h>
 
-/* ========== Internal structures ========== */
-
-/* Cipher state for one direction */
 typedef struct {
     EVP_CIPHER_CTX *ctx;
     unsigned char key[RAWSSH_KEY_SIZE];
     unsigned char iv[RAWSSH_IV_SIZE];
-    unsigned char mac_key[64]; /* up to 64 for sha512 */
+    unsigned char mac_key[64];
     int cipher_block;
     int key_len;
     int mac_len;
@@ -62,50 +44,40 @@ struct rawssh_session {
     int timeout_sec;
     char nic[64];
 
-    /* Version exchange */
     char server_version[256];
     char client_version[256];
 
-    /* KEXINIT payloads (needed for hash) */
     unsigned char *my_kexinit;
     int my_kexinit_len;
     unsigned char *peer_kexinit;
     int peer_kexinit_len;
 
-    /* DH key exchange */
     BIGNUM *dh_p;
     BIGNUM *dh_g;
-    BIGNUM *dh_x; /* private */
-    BIGNUM *dh_e; /* public */
-    BIGNUM *dh_f; /* server public */
-    BIGNUM *dh_k; /* shared secret */
+    BIGNUM *dh_x;
+    BIGNUM *dh_e;
+    BIGNUM *dh_f;
+    BIGNUM *dh_k;
 
-    /* Session ID and exchange hash */
     unsigned char session_id[64];
     int session_id_len;
     unsigned char exchange_hash[64];
 
-    /* Crypto state */
-    crypto_dir c2s; /* client to server */
-    crypto_dir s2c; /* server to client */
+    crypto_dir c2s;
+    crypto_dir s2c;
     int encrypted;
 
-    /* KEX algorithm selection */
-    int kex_type;       /* 0=dh-group14, 1=dh-group16, 2=curve25519, 3=ecdh-p256, 4=dh-gex-sha256, 5=dh-group1 */
-    int kex_hash_type;  /* 0=sha1, 1=sha256, 2=sha512 */
-    int cipher_key_len; /* 16, 24 or 32 (64 for chacha20-poly1305) */
-    int mac_type;       /* 0=hmac-sha1(20), 1=hmac-sha2-256(32), 2=hmac-md5(16) */
-    int is_chacha20;    /* 1 if using chacha20-poly1305@openssh.com */
-    int is_cbc;         /* 1 if using CBC mode cipher */
-    int is_3des;        /* 1 if using 3des-cbc */
+    int kex_type;
+    int kex_hash_type;
+    int cipher_key_len;
+    int mac_type;
+    int is_chacha20;
+    int is_cbc;
+    int is_3des;
+    int is_etm;
 
-    /* Authenticated flag */
     int authenticated;
-
-    /* Debug: which handshake step failed */
-    int handshake_step; /* 0=version, 1=kexinit_send, 2=kexinit_recv, 3=negotiate, 4=kex, 5=newkeys, 6=service */
-
-    /* Channel counter */
+    int handshake_step;
     uint32_t next_channel_id;
 };
 
@@ -118,13 +90,10 @@ struct rawssh_channel {
     int eof;
     int closed;
 
-    /* Read buffer for channel data */
     unsigned char data_buf[RAWSSH_MAX_PAYLOAD];
     int data_pos;
     int data_len;
 };
-
-/* ========== Byte-packing helpers (big-endian) ========== */
 
 static void put_u32(unsigned char *buf, uint32_t v) {
     buf[0] = (v >> 24) & 0xFF;
@@ -164,17 +133,15 @@ static void put_cstring(unsigned char *buf, const char *str, int *offset) {
     put_string(buf, str, len, offset);
 }
 
-/* Write BIGNUM as SSH mpint (with leading zero if high bit set) */
 static void put_mpint(unsigned char *buf, const BIGNUM *bn, int *offset) {
     int n = BN_num_bytes(bn);
     unsigned char *tmp = malloc(n + 1);
-    if (!tmp) { /* fallback: write zero-length mpint */
+    if (!tmp) {
         put_u32(buf + *offset, 0);
         *offset += 4;
         return;
     }
     BN_bn2bin(bn, tmp);
-    /* Check if leading byte has high bit set - need extra zero */
     int pad = (n > 0 && (tmp[0] & 0x80)) ? 1 : 0;
     put_u32(buf + *offset, n + pad);
     *offset += 4;
@@ -186,16 +153,12 @@ static void put_mpint(unsigned char *buf, const BIGNUM *bn, int *offset) {
     free(tmp);
 }
 
-/* ========== Low-level I/O ========== */
-
 static int sock_wait(int fd, int events, int timeout_ms) {
     struct pollfd pf = {fd, events, 0};
     int r = poll(&pf, 1, timeout_ms);
-    if (r <= 0) return r; /* 0 = timeout, -1 = error */
+    if (r <= 0) return r;
     if (pf.revents & POLLNVAL) return -1;
-    /* For reads: POLLIN with POLLHUP means data still available - allow it */
     if ((events & POLLIN) && (pf.revents & POLLIN)) return r;
-    /* For writes or pure POLLHUP/POLLERR without data: error */
     if (pf.revents & (POLLERR | POLLHUP)) return -1;
     return r;
 }
@@ -230,40 +193,34 @@ static int raw_recv(rawssh_session *s, void *data, int len) {
                 return RAWSSH_CLOSED;
             return RAWSSH_TCP_ERROR;
         }
-        if (r == 0) return RAWSSH_CLOSED; /* peer closed connection */
+        if (r == 0) return RAWSSH_CLOSED;
         got += r;
     }
     return got;
 }
 
-/* Read a line (for version exchange) */
-/* Optimized: use MSG_PEEK to find \n then read in bulk */
 static int read_line(rawssh_session *s, char *buf, int maxlen) {
     int pos = 0;
     while (pos < maxlen - 1) {
         int r = sock_wait(s->sock, POLLIN, s->timeout_sec * 1000);
         if (r <= 0) return (r == 0) ? RAWSSH_TIMEOUT : RAWSSH_TCP_ERROR;
-        /* Peek available data to find newline */
         int avail = maxlen - 1 - pos;
         r = recv(s->sock, buf + pos, avail, MSG_PEEK);
         if (r < 0) return (errno == ECONNRESET) ? RAWSSH_CLOSED : RAWSSH_TCP_ERROR;
-        if (r == 0) return RAWSSH_CLOSED; /* peer closed before sending version */
-        /* Scan for \n in peeked data */
+        if (r == 0) return RAWSSH_CLOSED;
         int nl = -1;
         for (int i = 0; i < r; i++) {
             if (buf[pos + i] == '\n') { nl = i; break; }
         }
         if (nl >= 0) {
-            /* Consume up to and including \n */
             int consume = nl + 1;
             r = recv(s->sock, buf + pos, consume, 0);
             if (r <= 0) return RAWSSH_CLOSED;
-            pos += nl; /* don't include \n */
+            pos += nl;
             if (pos > 0 && buf[pos - 1] == '\r') pos--;
             buf[pos] = 0;
             return pos;
         }
-        /* No newline yet - consume all peeked bytes */
         r = recv(s->sock, buf + pos, r, 0);
         if (r <= 0) return RAWSSH_CLOSED;
         pos += r;
@@ -272,9 +229,6 @@ static int read_line(rawssh_session *s, char *buf, int maxlen) {
     return pos;
 }
 
-/* ========== SSH Packet I/O ========== */
-
-/* Send an unencrypted SSH packet */
 static int send_packet_plain(rawssh_session *s, const unsigned char *payload, int plen) {
     int block = 8;
     int padlen = block - ((4 + 1 + plen) % block);
@@ -297,16 +251,13 @@ static int send_packet_plain(rawssh_session *s, const unsigned char *payload, in
     return RAWSSH_OK;
 }
 
-/* Send an encrypted SSH packet - chacha20-poly1305 AEAD mode */
 static int send_packet_chacha20(rawssh_session *s, const unsigned char *payload, int plen) {
-    /* chacha20-poly1305@openssh.com uses 8-byte block alignment */
     int block = 8;
     int padlen = block - ((4 + 1 + plen) % block);
     if (padlen < 4) padlen += block;
     int pktlen = 1 + plen + padlen;
     int total = 4 + pktlen;
 
-    /* Stack buffers for typical small packets - avoids malloc in hot path */
     unsigned char _sb_plain[512], _sb_enc[512], _sb_send[512];
     unsigned char *plain = (total <= (int)sizeof(_sb_plain)) ? _sb_plain : malloc(total);
     if (!plain) return RAWSSH_ALLOC_FAIL;
@@ -320,7 +271,6 @@ static int send_packet_chacha20(rawssh_session *s, const unsigned char *payload,
     memset(chacha_iv, 0, 16);
     put_u32(chacha_iv + 12, s->c2s.seq);
 
-    /* Step 1: Encrypt packet length (4 bytes) with header key */
     unsigned char enc_len[4];
     {
         EVP_CIPHER_CTX *hctx = EVP_CIPHER_CTX_new();
@@ -331,7 +281,6 @@ static int send_packet_chacha20(rawssh_session *s, const unsigned char *payload,
         EVP_CIPHER_CTX_free(hctx);
     }
 
-    /* Step 2: Derive Poly1305 one-time key */
     unsigned char poly_key[32];
     {
         EVP_CIPHER_CTX *kctx = EVP_CIPHER_CTX_new();
@@ -343,7 +292,6 @@ static int send_packet_chacha20(rawssh_session *s, const unsigned char *payload,
         EVP_CIPHER_CTX_free(kctx);
     }
 
-    /* Step 3: Encrypt payload */
     unsigned char *enc_payload = (pktlen <= (int)sizeof(_sb_enc)) ? _sb_enc : malloc(pktlen);
     if (!enc_payload) { if (plain != _sb_plain) free(plain); return RAWSSH_ALLOC_FAIL; }
     {
@@ -359,7 +307,6 @@ static int send_packet_chacha20(rawssh_session *s, const unsigned char *payload,
     }
     if (plain != _sb_plain) free(plain);
 
-    /* Step 4: Compute Poly1305 tag */
     unsigned char tag[16];
     {
         EVP_MAC *mac = EVP_MAC_fetch(NULL, "POLY1305", NULL);
@@ -375,7 +322,6 @@ static int send_packet_chacha20(rawssh_session *s, const unsigned char *payload,
         EVP_MAC_CTX_free(mctx);
     }
 
-    /* Send: encrypted_length(4) + encrypted_payload(pktlen) + tag(16) */
     int sendlen = 4 + pktlen + 16;
     unsigned char *sendbuf = (sendlen <= (int)sizeof(_sb_send)) ? _sb_send : malloc(sendlen);
     if (!sendbuf) { if (enc_payload != _sb_enc) free(enc_payload); return RAWSSH_ALLOC_FAIL; }
@@ -392,7 +338,17 @@ static int send_packet_chacha20(rawssh_session *s, const unsigned char *payload,
     return RAWSSH_OK;
 }
 
-/* Send an encrypted SSH packet - AES-CTR + HMAC mode */
+static int hmac_init_dir(HMAC_CTX *hctx, const crypto_dir *dir, int mac_type) {
+    if (mac_type == 1)
+        return HMAC_Init_ex(hctx, dir->mac_key, 32, EVP_sha256(), NULL);
+    else if (mac_type == 2)
+        return HMAC_Init_ex(hctx, dir->mac_key, 16, EVP_md5(), NULL);
+    else if (mac_type == 3)
+        return HMAC_Init_ex(hctx, dir->mac_key, 64, EVP_sha512(), NULL);
+    else
+        return HMAC_Init_ex(hctx, dir->mac_key, 20, EVP_sha1(), NULL);
+}
+
 static int send_packet_encrypted(rawssh_session *s, const unsigned char *payload, int plen) {
     if (s->is_chacha20)
         return send_packet_chacha20(s, payload, plen);
@@ -404,7 +360,6 @@ static int send_packet_encrypted(rawssh_session *s, const unsigned char *payload
     int pktlen = 1 + plen + padlen;
     int total = 4 + pktlen;
 
-    /* Stack buffers for typical small packets */
     unsigned char _sb_plain[512], _sb_enc[512];
     unsigned char *plain = (total <= (int)sizeof(_sb_plain)) ? _sb_plain : malloc(total);
     if (!plain) return RAWSSH_ALLOC_FAIL;
@@ -414,52 +369,46 @@ static int send_packet_encrypted(rawssh_session *s, const unsigned char *payload
     memcpy(plain + 5, payload, plen);
     RAND_bytes(plain + 5 + plen, padlen);
 
-    /* Compute MAC over seqno + unencrypted packet */
     unsigned char mac[RAWSSH_MAC_SIZE];
     int mac_len = s->c2s.mac_len;
-    if (mac_len > 0) {
-        unsigned char seqbuf[4];
-        put_u32(seqbuf, s->c2s.seq);
+    unsigned char seqbuf[4];
+    put_u32(seqbuf, s->c2s.seq);
 
-        unsigned int hmac_len = 0;
-        HMAC_CTX *hctx = HMAC_CTX_new();
-        if (!hctx) { if (plain != _sb_plain) free(plain); return RAWSSH_ALLOC_FAIL; }
-        if (s->mac_type == 1) {
-            HMAC_Init_ex(hctx, s->c2s.mac_key, 32, EVP_sha256(), NULL);
-        } else if (s->mac_type == 2) {
-            HMAC_Init_ex(hctx, s->c2s.mac_key, 16, EVP_md5(), NULL);
-        } else {
-            HMAC_Init_ex(hctx, s->c2s.mac_key, 20, EVP_sha1(), NULL);
+    if (s->is_etm) {
+        unsigned char *enc = (pktlen <= (int)sizeof(_sb_enc)) ? _sb_enc : malloc(pktlen);
+        if (!enc) { if (plain != _sb_plain) free(plain); return RAWSSH_ALLOC_FAIL; }
+        int outl = 0;
+        EVP_EncryptUpdate(s->c2s.ctx, enc, &outl, plain + 4, pktlen);
+
+        if (mac_len > 0) {
+            unsigned int hmac_len = 0;
+            HMAC_CTX *hctx = HMAC_CTX_new();
+            if (!hctx) { if (enc != _sb_enc) free(enc); if (plain != _sb_plain) free(plain); return RAWSSH_ALLOC_FAIL; }
+            hmac_init_dir(hctx, &s->c2s, s->mac_type);
+            HMAC_Update(hctx, seqbuf, 4);
+            HMAC_Update(hctx, plain, 4);
+            HMAC_Update(hctx, enc, pktlen);
+            HMAC_Final(hctx, mac, &hmac_len);
+            HMAC_CTX_free(hctx);
         }
-        HMAC_Update(hctx, seqbuf, 4);
-        HMAC_Update(hctx, plain, total);
-        HMAC_Final(hctx, mac, &hmac_len);
-        HMAC_CTX_free(hctx);
-    }
+        if (plain != _sb_plain) free(plain);
 
-    /* Encrypt */
-    unsigned char *enc = (total <= (int)sizeof(_sb_enc)) ? _sb_enc : malloc(total);
-    if (!enc) { if (plain != _sb_plain) free(plain); return RAWSSH_ALLOC_FAIL; }
-    int outl = 0;
-    EVP_EncryptUpdate(s->c2s.ctx, enc, &outl, plain, total);
-    if (plain != _sb_plain) free(plain);
-
-    /* Send encrypted data + MAC in single syscall via writev */
-    int rc;
-    if (mac_len > 0) {
-        struct iovec iov[2] = {
-            { .iov_base = enc, .iov_len = total },
+        unsigned char hdr[4];
+        put_u32(hdr, pktlen);
+        struct iovec iov[3] = {
+            { .iov_base = hdr, .iov_len = 4 },
+            { .iov_base = enc, .iov_len = pktlen },
             { .iov_base = mac, .iov_len = mac_len }
         };
-        int want = total + mac_len;
+        int want = 4 + pktlen + mac_len;
         int sent = 0;
         while (sent < want) {
             int r = sock_wait(s->sock, POLLOUT, s->timeout_sec * 1000);
             if (r <= 0) { if (enc != _sb_enc) free(enc); return (r == 0) ? RAWSSH_TIMEOUT : RAWSSH_TCP_ERROR; }
             int off = sent;
             int iovcnt = 0;
-            struct iovec wv[2];
-            for (int i = 0; i < 2; i++) {
+            struct iovec wv[3];
+            for (int i = 0; i < 3; i++) {
                 if (off >= (int)iov[i].iov_len) {
                     off -= iov[i].iov_len;
                 } else {
@@ -473,16 +422,61 @@ static int send_packet_encrypted(rawssh_session *s, const unsigned char *payload
             if (w <= 0) { if (enc != _sb_enc) free(enc); return RAWSSH_TCP_ERROR; }
             sent += w;
         }
-        rc = RAWSSH_OK;
+        if (enc != _sb_enc) free(enc);
     } else {
-        rc = raw_send(s, enc, total);
-        if (rc < 0) { if (enc != _sb_enc) free(enc); return rc; }
-        rc = RAWSSH_OK;
+        if (mac_len > 0) {
+            unsigned int hmac_len = 0;
+            HMAC_CTX *hctx = HMAC_CTX_new();
+            if (!hctx) { if (plain != _sb_plain) free(plain); return RAWSSH_ALLOC_FAIL; }
+            hmac_init_dir(hctx, &s->c2s, s->mac_type);
+            HMAC_Update(hctx, seqbuf, 4);
+            HMAC_Update(hctx, plain, total);
+            HMAC_Final(hctx, mac, &hmac_len);
+            HMAC_CTX_free(hctx);
+        }
+
+        unsigned char *enc = (total <= (int)sizeof(_sb_enc)) ? _sb_enc : malloc(total);
+        if (!enc) { if (plain != _sb_plain) free(plain); return RAWSSH_ALLOC_FAIL; }
+        int outl = 0;
+        EVP_EncryptUpdate(s->c2s.ctx, enc, &outl, plain, total);
+        if (plain != _sb_plain) free(plain);
+
+        if (mac_len > 0) {
+            struct iovec iov[2] = {
+                { .iov_base = enc, .iov_len = total },
+                { .iov_base = mac, .iov_len = mac_len }
+            };
+            int want = total + mac_len;
+            int sent = 0;
+            while (sent < want) {
+                int r = sock_wait(s->sock, POLLOUT, s->timeout_sec * 1000);
+                if (r <= 0) { if (enc != _sb_enc) free(enc); return (r == 0) ? RAWSSH_TIMEOUT : RAWSSH_TCP_ERROR; }
+                int off = sent;
+                int iovcnt = 0;
+                struct iovec wv[2];
+                for (int i = 0; i < 2; i++) {
+                    if (off >= (int)iov[i].iov_len) {
+                        off -= iov[i].iov_len;
+                    } else {
+                        wv[iovcnt].iov_base = (char*)iov[i].iov_base + off;
+                        wv[iovcnt].iov_len = iov[i].iov_len - off;
+                        iovcnt++;
+                        off = 0;
+                    }
+                }
+                ssize_t w = writev(s->sock, wv, iovcnt);
+                if (w <= 0) { if (enc != _sb_enc) free(enc); return RAWSSH_TCP_ERROR; }
+                sent += w;
+            }
+        } else {
+            int rc = raw_send(s, enc, total);
+            if (rc < 0) { if (enc != _sb_enc) free(enc); return rc; }
+        }
+        if (enc != _sb_enc) free(enc);
     }
-    if (enc != _sb_enc) free(enc);
 
     s->c2s.seq++;
-    return rc;
+    return RAWSSH_OK;
 }
 
 static int send_packet(rawssh_session *s, const unsigned char *payload, int plen) {
@@ -492,7 +486,6 @@ static int send_packet(rawssh_session *s, const unsigned char *payload, int plen
         return send_packet_plain(s, payload, plen);
 }
 
-/* Receive an unencrypted SSH packet */
 static int recv_packet_plain(rawssh_session *s, unsigned char *payload, int *plen) {
     unsigned char hdr[4];
     int rc = raw_recv(s, hdr, 4);
@@ -522,7 +515,6 @@ static int recv_packet_plain(rawssh_session *s, unsigned char *payload, int *ple
     return RAWSSH_OK;
 }
 
-/* Receive an encrypted SSH packet - chacha20-poly1305 AEAD mode */
 static int recv_packet_chacha20(rawssh_session *s, unsigned char *payload, int *plen) {
     unsigned char enc_len[4];
     int rc = raw_recv(s, enc_len, 4);
@@ -545,7 +537,6 @@ static int recv_packet_chacha20(rawssh_session *s, unsigned char *payload, int *
     uint32_t pktlen = get_u32(dec_len_buf);
     if (pktlen > RAWSSH_MAX_PACKET || pktlen < 2) return RAWSSH_PROTO_ERROR;
 
-    /* Stack buffers for typical small packets */
     unsigned char _sb_enc[512], _sb_dec[512];
     unsigned char *enc_payload = (pktlen <= sizeof(_sb_enc)) ? _sb_enc : malloc(pktlen);
     if (!enc_payload) return RAWSSH_ALLOC_FAIL;
@@ -556,7 +547,6 @@ static int recv_packet_chacha20(rawssh_session *s, unsigned char *payload, int *
     rc = raw_recv(s, tag_recv, 16);
     if (rc < 0) { if (enc_payload != _sb_enc) free(enc_payload); return rc; }
 
-    /* Derive Poly1305 key and verify tag */
     unsigned char poly_key[32];
     {
         EVP_CIPHER_CTX *kctx = EVP_CIPHER_CTX_new();
@@ -588,7 +578,6 @@ static int recv_packet_chacha20(rawssh_session *s, unsigned char *payload, int *
         return RAWSSH_PROTO_ERROR;
     }
 
-    /* Decrypt payload */
     unsigned char *dec_payload = (pktlen <= sizeof(_sb_dec)) ? _sb_dec : malloc(pktlen);
     if (!dec_payload) { if (enc_payload != _sb_enc) free(enc_payload); return RAWSSH_ALLOC_FAIL; }
     {
@@ -618,10 +607,69 @@ static int recv_packet_chacha20(rawssh_session *s, unsigned char *payload, int *
     return RAWSSH_OK;
 }
 
-/* Receive an encrypted SSH packet - AES-CTR + HMAC mode */
 static int recv_packet_encrypted(rawssh_session *s, unsigned char *payload, int *plen) {
     if (s->is_chacha20)
         return recv_packet_chacha20(s, payload, plen);
+
+    if (s->is_etm) {
+        unsigned char hdr[4];
+        int rc = raw_recv(s, hdr, 4);
+        if (rc < 0) return rc;
+
+        uint32_t pktlen = get_u32(hdr);
+        if (pktlen > RAWSSH_MAX_PACKET || pktlen < 2) return RAWSSH_PROTO_ERROR;
+
+        unsigned char _sb_enc[2048], _sb_dec[2048];
+        unsigned char *enc_data = (pktlen <= sizeof(_sb_enc)) ? _sb_enc : malloc(pktlen);
+        if (!enc_data) return RAWSSH_ALLOC_FAIL;
+        rc = raw_recv(s, enc_data, pktlen);
+        if (rc < 0) { if (enc_data != _sb_enc) free(enc_data); return rc; }
+
+        int mac_len = s->s2c.mac_len;
+        unsigned char mac_recv[RAWSSH_MAC_SIZE];
+        if (mac_len > 0) {
+            rc = raw_recv(s, mac_recv, mac_len);
+            if (rc < 0) { if (enc_data != _sb_enc) free(enc_data); return rc; }
+
+            unsigned char mac_calc[RAWSSH_MAC_SIZE];
+            unsigned char seqbuf[4];
+            put_u32(seqbuf, s->s2c.seq);
+
+            unsigned int hmac_len = 0;
+            HMAC_CTX *hctx = HMAC_CTX_new();
+            if (!hctx) { if (enc_data != _sb_enc) free(enc_data); return RAWSSH_ALLOC_FAIL; }
+            hmac_init_dir(hctx, &s->s2c, s->mac_type);
+            HMAC_Update(hctx, seqbuf, 4);
+            HMAC_Update(hctx, hdr, 4);
+            HMAC_Update(hctx, enc_data, pktlen);
+            HMAC_Final(hctx, mac_calc, &hmac_len);
+            HMAC_CTX_free(hctx);
+
+            if (CRYPTO_memcmp(mac_recv, mac_calc, mac_len) != 0) {
+                if (enc_data != _sb_enc) free(enc_data);
+                return RAWSSH_PROTO_ERROR;
+            }
+        }
+
+        unsigned char *dec_data = (pktlen <= sizeof(_sb_dec)) ? _sb_dec : malloc(pktlen);
+        if (!dec_data) { if (enc_data != _sb_enc) free(enc_data); return RAWSSH_ALLOC_FAIL; }
+        int outl = 0;
+        EVP_DecryptUpdate(s->s2c.ctx, dec_data, &outl, enc_data, pktlen);
+        if (enc_data != _sb_enc) free(enc_data);
+
+        int padlen = dec_data[0];
+        int datalen = pktlen - padlen - 1;
+        if (datalen < 0 || datalen > RAWSSH_MAX_PAYLOAD) {
+            if (dec_data != _sb_dec) free(dec_data);
+            return RAWSSH_PROTO_ERROR;
+        }
+
+        memcpy(payload, dec_data + 1, datalen);
+        *plen = datalen;
+        if (dec_data != _sb_dec) free(dec_data);
+        s->s2c.seq++;
+        return RAWSSH_OK;
+    }
 
     int block = s->s2c.cipher_block;
     if (block < 8) block = 8;
@@ -657,7 +705,6 @@ static int recv_packet_encrypted(rawssh_session *s, unsigned char *payload, int 
         if (full_enc != _sb_enc) free(full_enc);
     }
 
-    /* Read and verify MAC */
     int mac_len = s->s2c.mac_len;
     if (mac_len > 0) {
         unsigned char mac_recv[RAWSSH_MAC_SIZE];
@@ -671,13 +718,7 @@ static int recv_packet_encrypted(rawssh_session *s, unsigned char *payload, int 
         unsigned int hmac_len = 0;
         HMAC_CTX *hctx = HMAC_CTX_new();
         if (!hctx) { if (full_dec != _sb_dec) free(full_dec); return RAWSSH_ALLOC_FAIL; }
-        if (s->mac_type == 1) {
-            HMAC_Init_ex(hctx, s->s2c.mac_key, 32, EVP_sha256(), NULL);
-        } else if (s->mac_type == 2) {
-            HMAC_Init_ex(hctx, s->s2c.mac_key, 16, EVP_md5(), NULL);
-        } else {
-            HMAC_Init_ex(hctx, s->s2c.mac_key, 20, EVP_sha1(), NULL);
-        }
+        hmac_init_dir(hctx, &s->s2c, s->mac_type);
         HMAC_Update(hctx, seqbuf, 4);
         HMAC_Update(hctx, full_dec, 4 + pktlen);
         HMAC_Final(hctx, mac_calc, &hmac_len);
@@ -710,28 +751,20 @@ static int recv_packet_raw(rawssh_session *s, unsigned char *payload, int *plen)
         return recv_packet_plain(s, payload, plen);
 }
 
-/* Wrapper: auto-handle DISCONNECT, IGNORE, DEBUG per RFC 4253 §11
- * These messages can arrive at any time and must be handled transparently. */
 static int recv_packet(rawssh_session *s, unsigned char *payload, int *plen) {
     for (int i = 0; i < 20; i++) {
         int rc = recv_packet_raw(s, payload, plen);
         if (rc < 0) return rc;
-        /* Server is disconnecting us */
         if (payload[0] == SSH_MSG_DISCONNECT) return RAWSSH_CLOSED;
-        /* Skip debug/ignore messages - servers send these any time */
         if (payload[0] == SSH_MSG_IGNORE || payload[0] == SSH_MSG_DEBUG)
             continue;
-        /* SSH_MSG_UNIMPLEMENTED - skip but note it */
         if (payload[0] == SSH_MSG_UNIMPLEMENTED)
             continue;
         return rc;
     }
-    return RAWSSH_PROTO_ERROR; /* too many ignored messages */
+    return RAWSSH_PROTO_ERROR;
 }
 
-/* ========== Key Exchange ========== */
-
-/* RFC 2409 - Group 1 (Oakley Group 2, 1024-bit MODP) - legacy */
 static const char *dh_group1_p_hex =
     "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
     "29024E088A67CC74020BBEA63B139B22514A08798E3404DD"
@@ -742,7 +775,6 @@ static const char *dh_group1_p_hex =
     "83655D23DCA3AD961C62F356208552BB9ED529077096966D"
     "670C354E4ABC9804F1746C08CA237327FFFFFFFFFFFFFFFF";
 
-/* RFC 3526 - Group 14 (2048-bit MODP) */
 static const char *dh_group14_p_hex =
     "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
     "29024E088A67CC74020BBEA63B139B22514A08798E3404DD"
@@ -756,7 +788,6 @@ static const char *dh_group14_p_hex =
     "DE2BCBF6955817183995497CEA956AE515D2261898FA0510"
     "15728E5A8AACAA68FFFFFFFFFFFFFFFF";
 
-/* RFC 3526 - Group 16 (4096-bit MODP) */
 static const char *dh_group16_p_hex =
     "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
     "29024E088A67CC74020BBEA63B139B22514A08798E3404DD"
@@ -781,7 +812,6 @@ static const char *dh_group16_p_hex =
     "93B4EA988D8FDDC186FFB7DC90A6C08F4DF435C934063199"
     "FFFFFFFFFFFFFFFF";
 
-/* Helper: get EVP_MD for KEX hash */
 static const EVP_MD *get_kex_md(rawssh_session *s) {
     switch (s->kex_hash_type) {
         case 2:  return EVP_sha512();
@@ -790,14 +820,31 @@ static const EVP_MD *get_kex_md(rawssh_session *s) {
     }
 }
 
-#define KEX_LIST "curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256,diffie-hellman-group14-sha256,diffie-hellman-group16-sha512,diffie-hellman-group-exchange-sha256,diffie-hellman-group14-sha1,diffie-hellman-group1-sha1"
-#define HOSTKEY_LIST "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-256,rsa-sha2-512,ssh-rsa,ssh-dss"
-#define CIPHER_LIST "aes128-ctr,aes256-ctr,chacha20-poly1305@openssh.com,aes128-cbc,aes256-cbc,3des-cbc"
-#define MAC_LIST "hmac-sha2-256,hmac-sha1,hmac-md5"
+#define KEX_LIST \
+    "curve25519-sha256,curve25519-sha256@libssh.org," \
+    "ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521," \
+    "diffie-hellman-group14-sha256,diffie-hellman-group16-sha512," \
+    "diffie-hellman-group-exchange-sha256,diffie-hellman-group-exchange-sha1," \
+    "diffie-hellman-group14-sha1,diffie-hellman-group1-sha1"
 
-/* Build KEXINIT packet */
+#define HOSTKEY_LIST \
+    "ssh-ed25519," \
+    "ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521," \
+    "rsa-sha2-256,rsa-sha2-512,ssh-rsa,ssh-dss"
+
+#define CIPHER_LIST \
+    "chacha20-poly1305@openssh.com," \
+    "aes128-ctr,aes192-ctr,aes256-ctr," \
+    "aes128-cbc,aes192-cbc,aes256-cbc," \
+    "3des-cbc"
+
+#define MAC_LIST \
+    "hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com," \
+    "hmac-sha1-etm@openssh.com,hmac-md5-etm@openssh.com," \
+    "hmac-sha2-256,hmac-sha2-512,hmac-sha1,hmac-md5"
+
 static int build_kexinit(rawssh_session *s) {
-    unsigned char payload[2048];
+    unsigned char payload[4096];
     int off = 0;
 
     payload[off++] = SSH_MSG_KEXINIT;
@@ -825,13 +872,12 @@ static int build_kexinit(rawssh_session *s) {
     return send_packet(s, payload, off);
 }
 
-/* Find first matching algorithm from comma-separated lists */
 static int find_match(const char *client, const char *server, char *out, int outlen) {
     char *ccopy = strdup(client);
+    if (!ccopy) return -1;
     char *saveptr = NULL;
     char *tok = strtok_r(ccopy, ",", &saveptr);
     while (tok) {
-        /* Check if tok appears in server list */
         const char *p = server;
         while (p) {
             const char *comma = strchr(p, ',');
@@ -850,126 +896,134 @@ static int find_match(const char *client, const char *server, char *out, int out
     return -1;
 }
 
-/* Parse server KEXINIT and negotiate algorithms */
 static int parse_kexinit(rawssh_session *s, const unsigned char *payload, int plen) {
-    /* Save server kexinit for hash */
     s->peer_kexinit = malloc(plen);
+    if (!s->peer_kexinit) return RAWSSH_ALLOC_FAIL;
     memcpy(s->peer_kexinit, payload, plen);
     s->peer_kexinit_len = plen;
 
-    int off = 1 + 16; /* skip type + cookie */
+    int off = 1 + 16;
 
-    /* Parse name-lists */
     const unsigned char *data;
     uint32_t dlen;
-    char server_kex[1024] = {0};
-    char server_hostkey[1024] = {0};
-    char server_enc_c2s[1024] = {0};
-    char server_enc_s2c[1024] = {0};
-    char server_mac_c2s[1024] = {0};
-    char server_mac_s2c[1024] = {0};
+    char server_kex[2048] = {0};
+    char server_hostkey[2048] = {0};
+    char server_enc_c2s[2048] = {0};
+    char server_enc_s2c[2048] = {0};
+    char server_mac_c2s[2048] = {0};
+    char server_mac_s2c[2048] = {0};
 
-    /* kex_algorithms */
     if (get_string(payload, plen, &off, &data, &dlen) < 0) return RAWSSH_PROTO_ERROR;
-    snprintf(server_kex, sizeof(server_kex), "%.*s", (int)dlen, (char *)data);
+    if (dlen < sizeof(server_kex)) { memcpy(server_kex, data, dlen); server_kex[dlen] = 0; }
 
-    /* server_host_key_algorithms */
     if (get_string(payload, plen, &off, &data, &dlen) < 0) return RAWSSH_PROTO_ERROR;
-    snprintf(server_hostkey, sizeof(server_hostkey), "%.*s", (int)dlen, (char *)data);
+    if (dlen < sizeof(server_hostkey)) { memcpy(server_hostkey, data, dlen); server_hostkey[dlen] = 0; }
 
-    /* encryption c2s */
     if (get_string(payload, plen, &off, &data, &dlen) < 0) return RAWSSH_PROTO_ERROR;
-    snprintf(server_enc_c2s, sizeof(server_enc_c2s), "%.*s", (int)dlen, (char *)data);
+    if (dlen < sizeof(server_enc_c2s)) { memcpy(server_enc_c2s, data, dlen); server_enc_c2s[dlen] = 0; }
 
-    /* encryption s2c */
     if (get_string(payload, plen, &off, &data, &dlen) < 0) return RAWSSH_PROTO_ERROR;
-    snprintf(server_enc_s2c, sizeof(server_enc_s2c), "%.*s", (int)dlen, (char *)data);
+    if (dlen < sizeof(server_enc_s2c)) { memcpy(server_enc_s2c, data, dlen); server_enc_s2c[dlen] = 0; }
 
-    /* mac c2s */
     if (get_string(payload, plen, &off, &data, &dlen) < 0) return RAWSSH_PROTO_ERROR;
-    snprintf(server_mac_c2s, sizeof(server_mac_c2s), "%.*s", (int)dlen, (char *)data);
+    if (dlen < sizeof(server_mac_c2s)) { memcpy(server_mac_c2s, data, dlen); server_mac_c2s[dlen] = 0; }
 
-    /* mac s2c */
     if (get_string(payload, plen, &off, &data, &dlen) < 0) return RAWSSH_PROTO_ERROR;
-    snprintf(server_mac_s2c, sizeof(server_mac_s2c), "%.*s", (int)dlen, (char *)data);
+    if (dlen < sizeof(server_mac_s2c)) { memcpy(server_mac_s2c, data, dlen); server_mac_s2c[dlen] = 0; }
 
-    /* Negotiate */
-    char chosen_kex[64], chosen_cipher_c2s[64], chosen_cipher_s2c[64];
-    char chosen_mac_c2s[64], chosen_mac_s2c[64], chosen_hostkey[64];
+    char chosen_kex[64] = {0}, chosen_cipher_c2s[64] = {0}, chosen_cipher_s2c[64] = {0};
+    char chosen_mac_c2s[64] = {0}, chosen_mac_s2c[64] = {0}, chosen_hostkey[64] = {0};
 
+    s->handshake_step = 30;
     if (find_match(KEX_LIST, server_kex, chosen_kex, sizeof(chosen_kex)) < 0)
         return RAWSSH_PROTO_ERROR;
 
-    /* Determine KEX type and hash */
     if (strstr(chosen_kex, "curve25519")) {
-        s->kex_type = 2; s->kex_hash_type = 1; /* sha256 */
+        s->kex_type = 2; s->kex_hash_type = 1;
+    } else if (strcmp(chosen_kex, "ecdh-sha2-nistp521") == 0) {
+        s->kex_type = 3; s->kex_hash_type = 2;
+    } else if (strcmp(chosen_kex, "ecdh-sha2-nistp384") == 0) {
+        s->kex_type = 3; s->kex_hash_type = 1;
     } else if (strstr(chosen_kex, "ecdh-sha2-nistp256")) {
         s->kex_type = 3; s->kex_hash_type = 1;
-    } else if (strstr(chosen_kex, "group-exchange-sha256")) {
-        s->kex_type = 4; s->kex_hash_type = 1; /* sha256 */
+    } else if (strcmp(chosen_kex, "diffie-hellman-group-exchange-sha256") == 0) {
+        s->kex_type = 4; s->kex_hash_type = 1;
+    } else if (strcmp(chosen_kex, "diffie-hellman-group-exchange-sha1") == 0) {
+        s->kex_type = 4; s->kex_hash_type = 0;
     } else if (strstr(chosen_kex, "group16")) {
-        s->kex_type = 1; s->kex_hash_type = 2; /* sha512 */
+        s->kex_type = 1; s->kex_hash_type = 2;
     } else if (strstr(chosen_kex, "group14-sha256")) {
         s->kex_type = 0; s->kex_hash_type = 1;
     } else if (strstr(chosen_kex, "group1-sha1")) {
-        s->kex_type = 5; s->kex_hash_type = 0; /* group1, sha1 */
+        s->kex_type = 5; s->kex_hash_type = 0;
     } else {
-        s->kex_type = 0; s->kex_hash_type = 0; /* group14-sha1 */
+        s->kex_type = 0; s->kex_hash_type = 0;
     }
 
+    s->handshake_step = 31;
     if (find_match(HOSTKEY_LIST, server_hostkey, chosen_hostkey, sizeof(chosen_hostkey)) < 0)
         return RAWSSH_PROTO_ERROR;
 
+    s->handshake_step = 32;
     if (find_match(CIPHER_LIST, server_enc_c2s, chosen_cipher_c2s, sizeof(chosen_cipher_c2s)) < 0)
         return RAWSSH_PROTO_ERROR;
+    s->handshake_step = 33;
     if (find_match(CIPHER_LIST, server_enc_s2c, chosen_cipher_s2c, sizeof(chosen_cipher_s2c)) < 0)
         return RAWSSH_PROTO_ERROR;
 
-    /* Check for chacha20-poly1305@openssh.com */
     s->is_cbc = 0;
     s->is_3des = 0;
+    s->is_etm = 0;
+    s->is_chacha20 = 0;
+
     if (strstr(chosen_cipher_c2s, "chacha20-poly1305")) {
         s->is_chacha20 = 1;
-        s->cipher_key_len = 64; /* 2x32 bytes: main key + header key */
+        s->cipher_key_len = 64;
     } else if (strstr(chosen_cipher_c2s, "3des-cbc")) {
-        s->cipher_key_len = 24; /* 3DES uses 24-byte key */
+        s->cipher_key_len = 24;
         s->is_cbc = 1;
         s->is_3des = 1;
     } else if (strstr(chosen_cipher_c2s, "aes256")) {
         s->cipher_key_len = 32;
+        if (strstr(chosen_cipher_c2s, "cbc")) s->is_cbc = 1;
+    } else if (strstr(chosen_cipher_c2s, "aes192")) {
+        s->cipher_key_len = 24;
         if (strstr(chosen_cipher_c2s, "cbc")) s->is_cbc = 1;
     } else {
         s->cipher_key_len = 16;
         if (strstr(chosen_cipher_c2s, "cbc")) s->is_cbc = 1;
     }
 
-    /* For chacha20-poly1305, MAC is built into the cipher - no separate MAC needed */
     if (s->is_chacha20) {
-        /* Try to negotiate MAC but don't fail if server doesn't offer any we support */
-        find_match(MAC_LIST, server_mac_c2s, chosen_mac_c2s, sizeof(chosen_mac_c2s));
-        find_match(MAC_LIST, server_mac_s2c, chosen_mac_s2c, sizeof(chosen_mac_s2c));
-        s->mac_type = 0; /* unused with chacha20-poly1305 */
+        s->mac_type = 0;
     } else {
+        s->handshake_step = 34;
         if (find_match(MAC_LIST, server_mac_c2s, chosen_mac_c2s, sizeof(chosen_mac_c2s)) < 0)
             return RAWSSH_PROTO_ERROR;
+        s->handshake_step = 35;
         if (find_match(MAC_LIST, server_mac_s2c, chosen_mac_s2c, sizeof(chosen_mac_s2c)) < 0)
             return RAWSSH_PROTO_ERROR;
-        if (strstr(chosen_mac_c2s, "sha2-256"))
-            s->mac_type = 1; /* hmac-sha2-256, 32 bytes */
+
+        if (strstr(chosen_mac_c2s, "-etm@openssh.com"))
+            s->is_etm = 1;
+
+        if (strstr(chosen_mac_c2s, "sha2-512"))
+            s->mac_type = 3;
+        else if (strstr(chosen_mac_c2s, "sha2-256"))
+            s->mac_type = 1;
         else if (strstr(chosen_mac_c2s, "md5"))
-            s->mac_type = 2; /* hmac-md5, 16 bytes */
+            s->mac_type = 2;
         else
-            s->mac_type = 0; /* hmac-sha1, 20 bytes */
+            s->mac_type = 0;
     }
 
+    s->handshake_step = 3;
     return RAWSSH_OK;
 }
 
-/* Derive a key using the SSH key derivation (RFC 4253 Section 7.2) */
 static void derive_key(rawssh_session *s, char id, int need,
                        unsigned char *out) {
     const EVP_MD *md = get_kex_md(s);
-    int hash_len = EVP_MD_size(md);
 
     int klen = BN_num_bytes(s->dh_k);
     unsigned char *kbuf = malloc(klen + 5);
@@ -987,7 +1041,7 @@ static void derive_key(rawssh_session *s, char id, int need,
     unsigned int hlen;
     EVP_DigestFinal_ex(ctx, hash, &hlen);
 
-    int got = hlen < (unsigned)need ? hlen : need;
+    int got = (int)hlen < need ? (int)hlen : need;
     memcpy(out, hash, got);
 
     while (got < need) {
@@ -1005,7 +1059,6 @@ static void derive_key(rawssh_session *s, char id, int need,
     free(kbuf);
 }
 
-/* Exchange hash for DH (e,f are mpints) */
 static int compute_exchange_hash(rawssh_session *s,
                                   const unsigned char *k_s, int k_s_len,
                                   const BIGNUM *e, const BIGNUM *f,
@@ -1046,7 +1099,6 @@ static int compute_exchange_hash(rawssh_session *s,
     return RAWSSH_OK;
 }
 
-/* Exchange hash for ECDH/curve25519 (Q_C, Q_S are strings, not mpints) */
 static int compute_exchange_hash_ecdh(rawssh_session *s,
                                        const unsigned char *k_s, int k_s_len,
                                        const unsigned char *q_c, int q_c_len,
@@ -1087,9 +1139,8 @@ static int compute_exchange_hash_ecdh(rawssh_session *s,
     return RAWSSH_OK;
 }
 
-/* Complete KEX: NEWKEYS exchange + key derivation (shared by all KEX types) */
 static int complete_kex(rawssh_session *s) {
-    s->handshake_step = 5; /* newkeys */
+    s->handshake_step = 5;
     unsigned char nk = SSH_MSG_NEWKEYS;
     int rc = send_packet(s, &nk, 1);
     if (rc < 0) return rc;
@@ -1101,41 +1152,33 @@ static int complete_kex(rawssh_session *s) {
     if (rpayload[0] != SSH_MSG_NEWKEYS) return RAWSSH_PROTO_ERROR;
 
     if (s->is_chacha20) {
-        /* chacha20-poly1305@openssh.com key derivation:
-         * K_1 (main key, 32 bytes) = derive_key 'C'/'D'
-         * K_2 (header key, 32 bytes) = derive_key with higher bytes of the 64-byte key
-         * Per OpenSSH: the cipher key is 64 bytes, first 32 = K_2 (header), last 32 = K_1 (main)
-         * But in practice: derive 64 bytes total, K_2 = bytes 0..31, K_1 = bytes 32..63
-         * We store K_1 in key[] and K_2 in mac_key[] */
         unsigned char full_key_c2s[64], full_key_s2c[64];
         derive_key(s, 'C', 64, full_key_c2s);
         derive_key(s, 'D', 64, full_key_s2c);
 
-        /* K_1 (main encryption) = first 32 bytes, K_2 (header) = last 32 bytes */
-        memcpy(s->c2s.key, full_key_c2s, 32);      /* K_1 */
-        memcpy(s->c2s.mac_key, full_key_c2s + 32, 32); /* K_2 */
-        memcpy(s->s2c.key, full_key_s2c, 32);      /* K_1 */
-        memcpy(s->s2c.mac_key, full_key_s2c + 32, 32); /* K_2 */
+        memcpy(s->c2s.key, full_key_c2s, 32);
+        memcpy(s->c2s.mac_key, full_key_c2s + 32, 32);
+        memcpy(s->s2c.key, full_key_s2c, 32);
+        memcpy(s->s2c.mac_key, full_key_s2c + 32, 32);
 
-        /* No persistent cipher context needed - chacha20-poly1305 creates
-         * fresh contexts per-packet with sequence number as nonce */
         s->c2s.ctx = NULL;
         s->s2c.ctx = NULL;
         s->c2s.cipher_block = 8;
         s->s2c.cipher_block = 8;
         s->c2s.key_len = 32;
         s->s2c.key_len = 32;
-        s->c2s.mac_len = 0; /* Poly1305 replaces HMAC */
+        s->c2s.mac_len = 0;
         s->s2c.mac_len = 0;
     } else {
         int kl = s->cipher_key_len;
-        int bl = s->is_3des ? 8 : 16; /* 3DES has 8-byte blocks, AES has 16 */
-        int iv_len = bl; /* IV length = block size */
+        int bl = s->is_3des ? 8 : 16;
+        int iv_len = bl;
         int mac_kl;
         switch (s->mac_type) {
-            case 1:  mac_kl = 32; break; /* hmac-sha2-256 */
-            case 2:  mac_kl = 16; break; /* hmac-md5 */
-            default: mac_kl = 20; break; /* hmac-sha1 */
+            case 1:  mac_kl = 32; break;
+            case 2:  mac_kl = 16; break;
+            case 3:  mac_kl = 64; break;
+            default: mac_kl = 20; break;
         }
 
         derive_key(s, 'A', iv_len, s->c2s.iv);
@@ -1145,14 +1188,17 @@ static int complete_kex(rawssh_session *s) {
         derive_key(s, 'E', mac_kl, s->c2s.mac_key);
         derive_key(s, 'F', mac_kl, s->s2c.mac_key);
 
-        /* Select cipher based on key length and mode */
         const EVP_CIPHER *cipher;
         if (s->is_3des) {
             cipher = EVP_des_ede3_cbc();
         } else if (s->is_cbc) {
-            cipher = (kl == 32) ? EVP_aes_256_cbc() : EVP_aes_128_cbc();
+            if (kl == 32) cipher = EVP_aes_256_cbc();
+            else if (kl == 24) cipher = EVP_aes_192_cbc();
+            else cipher = EVP_aes_128_cbc();
         } else {
-            cipher = (kl == 32) ? EVP_aes_256_ctr() : EVP_aes_128_ctr();
+            if (kl == 32) cipher = EVP_aes_256_ctr();
+            else if (kl == 24) cipher = EVP_aes_192_ctr();
+            else cipher = EVP_aes_128_ctr();
         }
 
         s->c2s.ctx = EVP_CIPHER_CTX_new();
@@ -1174,20 +1220,21 @@ static int complete_kex(rawssh_session *s) {
     return RAWSSH_OK;
 }
 
-/* ========== KEX: DH group1/group14/group16 ========== */
 static int do_kex_dh(rawssh_session *s) {
     s->dh_p = BN_new(); s->dh_g = BN_new();
     s->dh_x = BN_new(); s->dh_e = BN_new();
 
-    if (s->kex_type == 1) /* group16 */
+    if (s->kex_type == 1)
         BN_hex2bn(&s->dh_p, dh_group16_p_hex);
-    else if (s->kex_type == 5) /* group1 (legacy 1024-bit) */
+    else if (s->kex_type == 5)
         BN_hex2bn(&s->dh_p, dh_group1_p_hex);
     else
         BN_hex2bn(&s->dh_p, dh_group14_p_hex);
     BN_set_word(s->dh_g, 2);
 
-    BN_rand(s->dh_x, 256, BN_RAND_TOP_ONE, BN_RAND_BOTTOM_ANY);
+    int pbits = BN_num_bits(s->dh_p);
+    int xbits = (pbits < 2048) ? 160 : 256;
+    BN_rand(s->dh_x, xbits, BN_RAND_TOP_ONE, BN_RAND_BOTTOM_ANY);
     BN_CTX *bnctx = BN_CTX_new();
     BN_mod_exp(s->dh_e, s->dh_g, s->dh_x, s->dh_p, bnctx);
 
@@ -1222,7 +1269,6 @@ static int do_kex_dh(rawssh_session *s) {
     return complete_kex(s);
 }
 
-/* ========== KEX: curve25519-sha256 ========== */
 static int do_kex_curve25519(rawssh_session *s) {
     EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
     if (!pctx) return RAWSSH_ALLOC_FAIL;
@@ -1238,7 +1284,7 @@ static int do_kex_curve25519(rawssh_session *s) {
 
     unsigned char payload[64];
     int off = 0;
-    payload[off++] = SSH_MSG_KEXDH_INIT; /* 30 */
+    payload[off++] = SSH_MSG_KEXDH_INIT;
     put_string(payload, cpub, 32, &off);
 
     int rc = send_packet(s, payload, off);
@@ -1277,7 +1323,6 @@ static int do_kex_curve25519(rawssh_session *s) {
     return complete_kex(s);
 }
 
-/* ========== KEX: ecdh-sha2-nistp256 ========== */
 static int do_kex_ecdh_p256(rawssh_session *s) {
     EC_KEY *ec = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
     if (!ec) return RAWSSH_ALLOC_FAIL;
@@ -1287,9 +1332,10 @@ static int do_kex_ecdh_p256(rawssh_session *s) {
     const EC_POINT *pub = EC_KEY_get0_public_key(ec);
     size_t cpub_len = EC_POINT_point2oct(grp, pub, POINT_CONVERSION_UNCOMPRESSED, NULL, 0, NULL);
     unsigned char *cpub = malloc(cpub_len);
+    if (!cpub) { EC_KEY_free(ec); return RAWSSH_ALLOC_FAIL; }
     EC_POINT_point2oct(grp, pub, POINT_CONVERSION_UNCOMPRESSED, cpub, cpub_len, NULL);
 
-    unsigned char payload[128];
+    unsigned char payload[256];
     int off = 0;
     payload[off++] = SSH_MSG_KEXDH_INIT;
     put_string(payload, cpub, cpub_len, &off);
@@ -1317,6 +1363,7 @@ static int do_kex_ecdh_p256(rawssh_session *s) {
 
     int field_size = (EC_GROUP_get_degree(grp) + 7) / 8;
     unsigned char *secret = malloc(field_size);
+    if (!secret) { EC_POINT_free(spub); free(cpub); EC_KEY_free(ec); return RAWSSH_ALLOC_FAIL; }
     int sec_len = ECDH_compute_key(secret, field_size, spub, ec, NULL);
     EC_POINT_free(spub);
 
@@ -1333,9 +1380,6 @@ static int do_kex_ecdh_p256(rawssh_session *s) {
     return complete_kex(s);
 }
 
-/* ========== KEX: diffie-hellman-group-exchange-sha256 (RFC 4419) ========== */
-
-/* Exchange hash for DH-GEX includes min/n/max and p/g from server */
 static int compute_exchange_hash_gex(rawssh_session *s,
                                       const unsigned char *k_s, int k_s_len,
                                       uint32_t gex_min, uint32_t gex_n, uint32_t gex_max,
@@ -1365,18 +1409,15 @@ static int compute_exchange_hash_gex(rawssh_session *s,
     put_string(tmp, k_s, k_s_len, &off);
     EVP_DigestUpdate(ctx, tmp, off);
 
-    /* GEX-specific: min, preferred, max */
     unsigned char gex_buf[12];
     put_u32(gex_buf, gex_min);
     put_u32(gex_buf + 4, gex_n);
     put_u32(gex_buf + 8, gex_max);
     EVP_DigestUpdate(ctx, gex_buf, 12);
 
-    /* p, g as mpints */
     off = 0; put_mpint(tmp, p, &off); EVP_DigestUpdate(ctx, tmp, off);
     off = 0; put_mpint(tmp, g, &off); EVP_DigestUpdate(ctx, tmp, off);
 
-    /* e, f, K as mpints */
     off = 0; put_mpint(tmp, e, &off); EVP_DigestUpdate(ctx, tmp, off);
     off = 0; put_mpint(tmp, f, &off); EVP_DigestUpdate(ctx, tmp, off);
     off = 0; put_mpint(tmp, k, &off); EVP_DigestUpdate(ctx, tmp, off);
@@ -1392,12 +1433,11 @@ static int compute_exchange_hash_gex(rawssh_session *s,
 }
 
 static int do_kex_dh_gex(rawssh_session *s) {
-    /* Step 1: Send GEX_REQUEST with min/preferred/max bits */
     uint32_t gex_min = 2048, gex_n = 4096, gex_max = 8192;
 
     unsigned char payload[64];
     int off = 0;
-    payload[off++] = SSH_MSG_KEX_DH_GEX_REQUEST; /* 34 */
+    payload[off++] = SSH_MSG_KEX_DH_GEX_REQUEST;
     put_u32(payload + off, gex_min); off += 4;
     put_u32(payload + off, gex_n); off += 4;
     put_u32(payload + off, gex_max); off += 4;
@@ -1405,7 +1445,6 @@ static int do_kex_dh_gex(rawssh_session *s) {
     int rc = send_packet(s, payload, off);
     if (rc < 0) return rc;
 
-    /* Step 2: Receive GEX_GROUP (p, g from server) */
     unsigned char rpayload[RAWSSH_MAX_PAYLOAD];
     int rplen;
     rc = recv_packet(s, rpayload, &rplen);
@@ -1423,20 +1462,20 @@ static int do_kex_dh_gex(rawssh_session *s) {
     BN_bin2bn(p_data, p_len, s->dh_p);
     BN_bin2bn(g_data, g_len, s->dh_g);
 
-    /* Step 3: Generate client DH key and send GEX_INIT */
-    BN_rand(s->dh_x, 256, BN_RAND_TOP_ONE, BN_RAND_BOTTOM_ANY);
+    int pbits = BN_num_bits(s->dh_p);
+    int xbits = (pbits < 2048) ? 160 : 256;
+    BN_rand(s->dh_x, xbits, BN_RAND_TOP_ONE, BN_RAND_BOTTOM_ANY);
     BN_CTX *bnctx = BN_CTX_new();
     BN_mod_exp(s->dh_e, s->dh_g, s->dh_x, s->dh_p, bnctx);
 
     unsigned char init_payload[1024];
     off = 0;
-    init_payload[off++] = SSH_MSG_KEX_DH_GEX_INIT; /* 32 */
+    init_payload[off++] = SSH_MSG_KEX_DH_GEX_INIT;
     put_mpint(init_payload, s->dh_e, &off);
 
     rc = send_packet(s, init_payload, off);
     if (rc < 0) { BN_CTX_free(bnctx); return rc; }
 
-    /* Step 4: Receive GEX_REPLY */
     rc = recv_packet(s, rpayload, &rplen);
     if (rc < 0) { BN_CTX_free(bnctx); return rc; }
     if (rpayload[0] != SSH_MSG_KEX_DH_GEX_REPLY) { BN_CTX_free(bnctx); return RAWSSH_PROTO_ERROR; }
@@ -1453,7 +1492,6 @@ static int do_kex_dh_gex(rawssh_session *s) {
     BN_mod_exp(s->dh_k, s->dh_f, s->dh_x, s->dh_p, bnctx);
     BN_CTX_free(bnctx);
 
-    /* Compute exchange hash (includes GEX-specific fields) */
     rc = compute_exchange_hash_gex(s, k_s_data, k_s_len,
                                     gex_min, gex_n, gex_max,
                                     s->dh_p, s->dh_g,
@@ -1461,8 +1499,6 @@ static int do_kex_dh_gex(rawssh_session *s) {
     if (rc < 0) return rc;
     return complete_kex(s);
 }
-
-/* ========== Service Request & User Auth ========== */
 
 static int request_service(rawssh_session *s, const char *service) {
     unsigned char payload[256];
@@ -1478,7 +1514,6 @@ static int request_service(rawssh_session *s, const char *service) {
     rc = recv_packet(s, rpayload, &rplen);
     if (rc < 0) return rc;
 
-    /* Accept SSH_MSG_SERVICE_ACCEPT - skip any banners */
     while (rpayload[0] == SSH_MSG_USERAUTH_BANNER) {
         rc = recv_packet(s, rpayload, &rplen);
         if (rc < 0) return rc;
@@ -1489,10 +1524,7 @@ static int request_service(rawssh_session *s, const char *service) {
     return RAWSSH_OK;
 }
 
-/* ========== Public API ========== */
-
 int rawssh_global_init(void) {
-    /* OpenSSL 1.1.0+ auto-inits and is thread-safe by default */
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
     OpenSSL_add_all_algorithms();
     ERR_load_crypto_strings();
@@ -1513,7 +1545,7 @@ rawssh_session *rawssh_session_new(void) {
     s->sock = -1;
     s->timeout_sec = 5;
     s->nic[0] = 0;
-    snprintf(s->client_version, sizeof(s->client_version), "SSH-2.0-RawSSH_1.0");
+    snprintf(s->client_version, sizeof(s->client_version), "SSH-2.0-OpenSSH_8.9");
     return s;
 }
 
@@ -1546,21 +1578,16 @@ int rawssh_connect(rawssh_session *s, const char *host, int port) {
     s->sock = socket(AF_INET, SOCK_STREAM, 0);
     if (s->sock < 0) return RAWSSH_TCP_ERROR;
 
-    /* Reuse address to avoid port exhaustion */
     int one = 1;
     setsockopt(s->sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 
-    /* Bind to specific NIC if configured (soft-fail: ignore if not permitted) */
     if (s->nic[0]) {
         setsockopt(s->sock, SOL_SOCKET, SO_BINDTODEVICE,
                    s->nic, strlen(s->nic) + 1);
-        /* Ignore errors - SO_BINDTODEVICE requires CAP_NET_RAW */
     }
 
-    /* Set TCP_NODELAY for speed */
     setsockopt(s->sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
-    /* Non-blocking connect */
     int fl = fcntl(s->sock, F_GETFL, 0);
     fcntl(s->sock, F_SETFL, fl | O_NONBLOCK);
 
@@ -1577,7 +1604,6 @@ int rawssh_connect(rawssh_session *s, const char *host, int port) {
     connect(s->sock, (struct sockaddr *)&addr, sizeof(addr));
 
     struct pollfd pf = {s->sock, POLLOUT, 0};
-    /* Cap connect timeout at 2s - dead hosts waste less time */
     int connect_tmo = (s->timeout_sec > 2) ? 2000 : s->timeout_sec * 1000;
     if (poll(&pf, 1, connect_tmo) <= 0) {
         close(s->sock);
@@ -1599,17 +1625,14 @@ int rawssh_connect(rawssh_session *s, const char *host, int port) {
         return RAWSSH_TCP_ERROR;
     }
 
-    /* Back to blocking with timeout */
     fcntl(s->sock, F_SETFL, fl);
     struct timeval tv = {s->timeout_sec, 0};
     setsockopt(s->sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(s->sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-    /* Reduce socket linger to avoid TIME_WAIT buildup */
     struct linger lg = {1, 0};
     setsockopt(s->sock, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
 
-    /* Enable TCP keepalive with aggressive timers to kill zombie sockets */
     setsockopt(s->sock, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
     int keepidle = 5, keepintvl = 3, keepcnt = 3;
     setsockopt(s->sock, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
@@ -1624,14 +1647,12 @@ int rawssh_connect(rawssh_session *s, const char *host, int port) {
 }
 
 int rawssh_handshake(rawssh_session *s) {
-    /* Send our version string */
-    s->handshake_step = 0; /* version exchange */
+    s->handshake_step = 0;
     char ver[128];
     int vlen = snprintf(ver, sizeof(ver), "%s\r\n", s->client_version);
     int rc = raw_send(s, ver, vlen);
     if (rc < 0) return rc;
 
-    /* Read server version - skip any banner lines that don't start with SSH- */
     for (int i = 0; i < 20; i++) {
         rc = read_line(s, s->server_version, sizeof(s->server_version));
         if (rc < 0) return rc;
@@ -1641,36 +1662,31 @@ int rawssh_handshake(rawssh_session *s) {
     if (strncmp(s->server_version, "SSH-", 4) != 0)
         return RAWSSH_PROTO_ERROR;
 
-    /* Send KEXINIT */
-    s->handshake_step = 1; /* kexinit send */
+    s->handshake_step = 1;
     rc = build_kexinit(s);
     if (rc < 0) return rc;
 
-    /* Receive server KEXINIT */
-    s->handshake_step = 2; /* kexinit recv */
+    s->handshake_step = 2;
     unsigned char rpayload[RAWSSH_MAX_PAYLOAD];
     int rplen;
     rc = recv_packet(s, rpayload, &rplen);
     if (rc < 0) return rc;
     if (rpayload[0] != SSH_MSG_KEXINIT) return RAWSSH_PROTO_ERROR;
 
-    /* Parse and negotiate */
-    s->handshake_step = 3; /* negotiate */
+    s->handshake_step = 3;
     rc = parse_kexinit(s, rpayload, rplen);
     if (rc < 0) return rc;
 
-    /* Perform key exchange based on negotiated algorithm */
-    s->handshake_step = 4; /* kex */
+    s->handshake_step = 4;
     switch (s->kex_type) {
         case 2: rc = do_kex_curve25519(s); break;
         case 3: rc = do_kex_ecdh_p256(s); break;
-        case 4: rc = do_kex_dh_gex(s); break; /* group-exchange-sha256 */
-        default: rc = do_kex_dh(s); break; /* group1, group14, or group16 */
+        case 4: rc = do_kex_dh_gex(s); break;
+        default: rc = do_kex_dh(s); break;
     }
     if (rc < 0) return rc;
 
-    /* Request ssh-userauth service */
-    s->handshake_step = 6; /* service */
+    s->handshake_step = 6;
     rc = request_service(s, "ssh-userauth");
     if (rc < 0) return rc;
 
@@ -1685,35 +1701,27 @@ int rawssh_auth_password(rawssh_session *s, const char *user, const char *pass) 
     put_cstring(payload, user, &off);
     put_cstring(payload, "ssh-connection", &off);
     put_cstring(payload, "password", &off);
-    payload[off++] = 0; /* FALSE = not changing password */
+    payload[off++] = 0;
     put_cstring(payload, pass, &off);
 
     int rc = send_packet(s, payload, off);
-    if (rc < 0) return RAWSSH_CLOSED; /* Can't send = connection dead */
+    if (rc < 0) return RAWSSH_CLOSED;
 
     unsigned char rpayload[RAWSSH_MAX_PAYLOAD];
     int rplen;
 
     for (int i = 0; i < 10; i++) {
         rc = recv_packet(s, rpayload, &rplen);
-        if (rc < 0) {
-            /* Server dropped connection - likely MaxAuthTries exceeded.
-             * Return CLOSED so caller reconnects cleanly instead of
-             * counting it as an unexpected error. */
-            return RAWSSH_CLOSED;
-        }
+        if (rc < 0) return RAWSSH_CLOSED;
 
         if (rpayload[0] == SSH_MSG_USERAUTH_SUCCESS) {
             s->authenticated = 1;
             return RAWSSH_OK;
         }
-        if (rpayload[0] == SSH_MSG_USERAUTH_FAILURE) {
+        if (rpayload[0] == SSH_MSG_USERAUTH_FAILURE)
             return RAWSSH_AUTH_FAIL;
-        }
-        if (rpayload[0] == SSH_MSG_USERAUTH_BANNER) {
-            continue; /* skip banner, try next message */
-        }
-        /* Unknown message - skip */
+        if (rpayload[0] == SSH_MSG_USERAUTH_BANNER)
+            continue;
     }
 
     return RAWSSH_AUTH_FAIL;
@@ -1726,7 +1734,7 @@ void rawssh_disconnect(rawssh_session *s) {
         unsigned char payload[64];
         int off = 0;
         payload[off++] = SSH_MSG_DISCONNECT;
-        put_u32(payload + off, 11); /* SSH_DISCONNECT_BY_APPLICATION */
+        put_u32(payload + off, 11);
         off += 4;
         put_cstring(payload, "", &off);
         put_cstring(payload, "", &off);
@@ -1750,9 +1758,9 @@ rawssh_channel *rawssh_channel_open(rawssh_session *s) {
     int off = 0;
     payload[off++] = SSH_MSG_CHANNEL_OPEN;
     put_cstring(payload, "session", &off);
-    put_u32(payload + off, ch->local_id); off += 4;   /* sender channel */
-    put_u32(payload + off, 0x100000); off += 4;        /* initial window */
-    put_u32(payload + off, 0x4000); off += 4;          /* max packet */
+    put_u32(payload + off, ch->local_id); off += 4;
+    put_u32(payload + off, 0x100000); off += 4;
+    put_u32(payload + off, 0x4000); off += 4;
 
     int rc = send_packet(s, payload, off);
     if (rc < 0) { free(ch); return NULL; }
@@ -1766,7 +1774,7 @@ rawssh_channel *rawssh_channel_open(rawssh_session *s) {
 
         if (rpayload[0] == SSH_MSG_CHANNEL_OPEN_CONFIRM) {
             int roff = 1;
-            roff += 4; /* recipient channel (our id) */
+            roff += 4;
             ch->remote_id = get_u32(rpayload + roff); roff += 4;
             ch->remote_window = get_u32(rpayload + roff); roff += 4;
             ch->remote_maxpkt = get_u32(rpayload + roff);
@@ -1776,7 +1784,6 @@ rawssh_channel *rawssh_channel_open(rawssh_session *s) {
             free(ch);
             return NULL;
         }
-        /* Skip banners, debug, etc */
     }
 
     free(ch);
@@ -1791,13 +1798,12 @@ int rawssh_channel_exec(rawssh_channel *ch, const char *cmd) {
     payload[off++] = SSH_MSG_CHANNEL_REQUEST;
     put_u32(payload + off, ch->remote_id); off += 4;
     put_cstring(payload, "exec", &off);
-    payload[off++] = 1; /* want reply */
+    payload[off++] = 1;
     put_cstring(payload, cmd, &off);
 
     int rc = send_packet(s, payload, off);
     if (rc < 0) return rc;
 
-    /* Wait for channel success/failure */
     unsigned char rpayload[RAWSSH_MAX_PAYLOAD];
     int rplen;
 
@@ -1807,18 +1813,16 @@ int rawssh_channel_exec(rawssh_channel *ch, const char *cmd) {
 
         if (rpayload[0] == SSH_MSG_CHANNEL_SUCCESS) return RAWSSH_OK;
         if (rpayload[0] == SSH_MSG_CHANNEL_FAILURE) return RAWSSH_CHANNEL_FAIL;
-
         if (rpayload[0] == SSH_MSG_CHANNEL_WINDOW_ADJUST) continue;
 
         if (rpayload[0] == SSH_MSG_CHANNEL_DATA) {
-            /* Buffer the data */
             int doff = 1;
-            doff += 4; /* recipient channel */
+            doff += 4;
             const unsigned char *data;
             uint32_t dlen;
             if (get_string(rpayload, rplen, &doff, &data, &dlen) == 0) {
                 int space = sizeof(ch->data_buf) - ch->data_len;
-                int copy = dlen < (uint32_t)space ? dlen : space;
+                int copy = (int)dlen < space ? (int)dlen : space;
                 memcpy(ch->data_buf + ch->data_len, data, copy);
                 ch->data_len += copy;
             }
@@ -1835,7 +1839,6 @@ int rawssh_channel_exec(rawssh_channel *ch, const char *cmd) {
 int rawssh_channel_read(rawssh_channel *ch, char *buf, int len) {
     rawssh_session *s = ch->session;
 
-    /* First return any buffered data */
     if (ch->data_pos < ch->data_len) {
         int avail = ch->data_len - ch->data_pos;
         int copy = avail < len ? avail : len;
@@ -1846,12 +1849,10 @@ int rawssh_channel_read(rawssh_channel *ch, char *buf, int len) {
 
     if (ch->eof || ch->closed) return 0;
 
-    /* Try to read more packets */
     for (int i = 0; i < 50; i++) {
         unsigned char rpayload[RAWSSH_MAX_PAYLOAD];
         int rplen;
 
-        /* Quick timeout check */
         struct pollfd pf = {s->sock, POLLIN, 0};
         int pr = poll(&pf, 1, s->timeout_sec * 1000);
         if (pr <= 0) return 0;
@@ -1865,7 +1866,7 @@ int rawssh_channel_read(rawssh_channel *ch, char *buf, int len) {
             const unsigned char *data;
             uint32_t dlen;
             if (get_string(rpayload, rplen, &doff, &data, &dlen) == 0) {
-                int copy = dlen < (uint32_t)len ? dlen : len;
+                int copy = (int)dlen < len ? (int)dlen : len;
                 memcpy(buf, data, copy);
                 return copy;
             }
@@ -1892,7 +1893,6 @@ void rawssh_channel_close(rawssh_channel *ch) {
     send_packet(s, payload, off);
     ch->closed = 1;
 
-    /* Drain pending close from server - fast timeout for brute force */
     for (int i = 0; i < 3; i++) {
         struct pollfd pf = {s->sock, POLLIN, 0};
         if (poll(&pf, 1, 100) <= 0) break;
@@ -1943,6 +1943,12 @@ const char *rawssh_handshake_step_str(rawssh_session *s) {
         case 4: return "kex";
         case 5: return "newkeys";
         case 6: return "service";
+        case 30: return "negotiate_kex";
+        case 31: return "negotiate_hostkey";
+        case 32: return "negotiate_cipher_c2s";
+        case 33: return "negotiate_cipher_s2c";
+        case 34: return "negotiate_mac_c2s";
+        case 35: return "negotiate_mac_s2c";
         default: return "unknown";
     }
 }
