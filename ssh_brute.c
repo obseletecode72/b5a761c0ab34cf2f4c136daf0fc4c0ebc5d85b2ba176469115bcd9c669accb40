@@ -603,6 +603,16 @@ static void process(int idx) {
         ses = NULL;
 
         if (rc == RAWSSH_CLOSED) {
+            if (auth_count == 0) {
+                atomic_fetch_add(&G_sess_err, 1);
+                if (++errs >= 3) {
+                    sem_post(&g_sem);
+                    goto done;
+                }
+            } else {
+                errs = 0;
+            }
+            
             ses = open_session(t->ip, t->port);
             if (!ses) {
                 sem_post(&g_sem);
