@@ -5,10 +5,11 @@
  * Suporte a bind direto na NIC (SO_BINDTODEVICE)
  *
  * Algoritmos suportados:
- *   KEX: curve25519-sha256, ecdh-sha2-nistp256, diffie-hellman-group14/16
+ *   KEX: curve25519-sha256, ecdh-sha2-nistp256, diffie-hellman-group14/16,
+ *        diffie-hellman-group-exchange-sha256
  *   Host key: ssh-ed25519, ecdsa-sha2-nistp*, rsa-sha2-*, ssh-rsa
- *   Cipher: aes128-ctr, aes256-ctr
- *   MAC: hmac-sha2-256, hmac-sha1
+ *   Cipher: chacha20-poly1305@openssh.com, aes128-ctr, aes256-ctr
+ *   MAC: hmac-sha2-256, hmac-sha1 (implicit with chacha20-poly1305)
  *   Compression: none
  */
 
@@ -41,6 +42,7 @@
 #include <openssl/err.h>
 #include <openssl/ec.h>
 #include <openssl/ecdh.h>
+#include <openssl/params.h>
 
 /* ========== Internal structures ========== */
 
@@ -90,10 +92,11 @@ struct rawssh_session {
     int encrypted;
 
     /* KEX algorithm selection */
-    int kex_type;       /* 0=dh-group14, 1=dh-group16, 2=curve25519, 3=ecdh-p256 */
+    int kex_type;       /* 0=dh-group14, 1=dh-group16, 2=curve25519, 3=ecdh-p256, 4=dh-gex-sha256 */
     int kex_hash_type;  /* 0=sha1, 1=sha256, 2=sha512 */
-    int cipher_key_len; /* 16 or 32 */
+    int cipher_key_len; /* 16 or 32 (64 for chacha20-poly1305) */
     int mac_is_sha256;  /* independent from kex hash */
+    int is_chacha20;    /* 1 if using chacha20-poly1305@openssh.com */
 
     /* Authenticated flag */
     int authenticated;
@@ -278,8 +281,118 @@ static int send_packet_plain(rawssh_session *s, const unsigned char *payload, in
     return RAWSSH_OK;
 }
 
-/* Send an encrypted SSH packet */
+/* Send an encrypted SSH packet - chacha20-poly1305 AEAD mode */
+static int send_packet_chacha20(rawssh_session *s, const unsigned char *payload, int plen) {
+    /* chacha20-poly1305@openssh.com uses 8-byte block alignment */
+    int block = 8;
+    int padlen = block - ((4 + 1 + plen) % block);
+    if (padlen < 4) padlen += block;
+    int pktlen = 1 + plen + padlen;
+    int total = 4 + pktlen;
+
+    unsigned char *plain = malloc(total);
+    if (!plain) return RAWSSH_ALLOC_FAIL;
+
+    put_u32(plain, pktlen);
+    plain[4] = (unsigned char)padlen;
+    memcpy(plain + 5, payload, plen);
+    RAND_bytes(plain + 5 + plen, padlen);
+
+    /* OpenSSL EVP_chacha20 IV layout: 4 bytes counter (LE) + 12 bytes nonce
+     * SSH chacha20-poly1305 nonce = 8-byte big-endian sequence number
+     * We place it at the END of the 12-byte nonce field: 4 zero + 8-byte seqno */
+    unsigned char chacha_iv[16];
+    memset(chacha_iv, 0, 16);
+    /* counter = 0 at bytes 0-3 (already zeroed) */
+    /* nonce padding at bytes 4-7 (already zeroed) */
+    put_u32(chacha_iv + 12, s->c2s.seq); /* seqno at bytes 12-15 (big-endian, but only 32-bit) */
+    /* Actually per openssh: nonce is 8 bytes, placed as the full 12-byte nonce:
+     * bytes 4-7 = 0, bytes 8-11 = 0, bytes 12-15 = seqno
+     * But OpenSSL nonce is 12 bytes at IV[4..15] */
+    memset(chacha_iv + 4, 0, 8); /* first 8 bytes of nonce = 0 */
+    put_u32(chacha_iv + 12, s->c2s.seq); /* last 4 bytes of nonce = seqno */
+
+    /* Step 1: Encrypt packet length (4 bytes) with header key (K_2, stored at mac_key) */
+    unsigned char enc_len[4];
+    {
+        EVP_CIPHER_CTX *hctx = EVP_CIPHER_CTX_new();
+        if (!hctx) { free(plain); return RAWSSH_ALLOC_FAIL; }
+        EVP_EncryptInit_ex(hctx, EVP_chacha20(), NULL, s->c2s.mac_key, chacha_iv);
+        int outl = 0;
+        EVP_EncryptUpdate(hctx, enc_len, &outl, plain, 4);
+        EVP_CIPHER_CTX_free(hctx);
+    }
+
+    /* Step 2: Derive Poly1305 one-time key from counter=0 block of main key */
+    unsigned char poly_key[32];
+    {
+        EVP_CIPHER_CTX *kctx = EVP_CIPHER_CTX_new();
+        if (!kctx) { free(plain); return RAWSSH_ALLOC_FAIL; }
+        EVP_EncryptInit_ex(kctx, EVP_chacha20(), NULL, s->c2s.key, chacha_iv);
+        unsigned char zeros[32] = {0};
+        int outl = 0;
+        EVP_EncryptUpdate(kctx, poly_key, &outl, zeros, 32);
+        EVP_CIPHER_CTX_free(kctx);
+    }
+
+    /* Step 3: Encrypt payload with main key, counter starting at 1
+     * Skip first 64 bytes (counter block 0 used for poly1305 key) */
+    unsigned char *enc_payload = malloc(pktlen);
+    if (!enc_payload) { free(plain); return RAWSSH_ALLOC_FAIL; }
+    {
+        EVP_CIPHER_CTX *pctx = EVP_CIPHER_CTX_new();
+        if (!pctx) { free(enc_payload); free(plain); return RAWSSH_ALLOC_FAIL; }
+        EVP_EncryptInit_ex(pctx, EVP_chacha20(), NULL, s->c2s.key, chacha_iv);
+        /* Discard first 64 bytes to advance past counter=0 block */
+        unsigned char discard[64];
+        int outl = 0;
+        EVP_EncryptUpdate(pctx, discard, &outl, discard, 64);
+        outl = 0;
+        EVP_EncryptUpdate(pctx, enc_payload, &outl, plain + 4, pktlen);
+        EVP_CIPHER_CTX_free(pctx);
+    }
+    free(plain);
+
+    /* Step 4: Compute Poly1305 tag over encrypted_length + encrypted_payload */
+    unsigned char tag[16];
+    {
+        EVP_MAC *mac = EVP_MAC_fetch(NULL, "POLY1305", NULL);
+        if (!mac) { free(enc_payload); return RAWSSH_ALLOC_FAIL; }
+        EVP_MAC_CTX *mctx = EVP_MAC_CTX_new(mac);
+        EVP_MAC_free(mac);
+        if (!mctx) { free(enc_payload); return RAWSSH_ALLOC_FAIL; }
+        OSSL_PARAM params[2];
+        params[0] = OSSL_PARAM_END;
+
+        EVP_MAC_init(mctx, poly_key, 32, params);
+        EVP_MAC_update(mctx, enc_len, 4);
+        EVP_MAC_update(mctx, enc_payload, pktlen);
+        size_t taglen = 16;
+        EVP_MAC_final(mctx, tag, &taglen, 16);
+        EVP_MAC_CTX_free(mctx);
+    }
+
+    /* Send: encrypted_length(4) + encrypted_payload(pktlen) + tag(16) */
+    unsigned char *sendbuf = malloc(4 + pktlen + 16);
+    if (!sendbuf) { free(enc_payload); return RAWSSH_ALLOC_FAIL; }
+    memcpy(sendbuf, enc_len, 4);
+    memcpy(sendbuf + 4, enc_payload, pktlen);
+    memcpy(sendbuf + 4 + pktlen, tag, 16);
+    free(enc_payload);
+
+    int rc = raw_send(s, sendbuf, 4 + pktlen + 16);
+    free(sendbuf);
+    if (rc < 0) return rc;
+
+    s->c2s.seq++;
+    return RAWSSH_OK;
+}
+
+/* Send an encrypted SSH packet - AES-CTR + HMAC mode */
 static int send_packet_encrypted(rawssh_session *s, const unsigned char *payload, int plen) {
+    if (s->is_chacha20)
+        return send_packet_chacha20(s, payload, plen);
+
     int block = s->c2s.cipher_block;
     if (block < 8) block = 8;
     int padlen = block - ((4 + 1 + plen) % block);
@@ -401,8 +514,113 @@ static int recv_packet_plain(rawssh_session *s, unsigned char *payload, int *ple
     return RAWSSH_OK;
 }
 
-/* Receive an encrypted SSH packet */
+/* Receive an encrypted SSH packet - chacha20-poly1305 AEAD mode */
+static int recv_packet_chacha20(rawssh_session *s, unsigned char *payload, int *plen) {
+    /* Step 1: Read encrypted length (4 bytes) */
+    unsigned char enc_len[4];
+    int rc = raw_recv(s, enc_len, 4);
+    if (rc < 0) return rc;
+
+    /* Build IV: 4-byte LE counter (0) + 12-byte nonce (4 zero + 4 zero + 4 seqno BE) */
+    unsigned char chacha_iv[16];
+    memset(chacha_iv, 0, 16);
+    put_u32(chacha_iv + 12, s->s2c.seq);
+
+    /* Decrypt length using header key (K_2, stored in mac_key) */
+    unsigned char dec_len_buf[4];
+    {
+        EVP_CIPHER_CTX *hctx = EVP_CIPHER_CTX_new();
+        if (!hctx) return RAWSSH_ALLOC_FAIL;
+        EVP_DecryptInit_ex(hctx, EVP_chacha20(), NULL, s->s2c.mac_key, chacha_iv);
+        int outl = 0;
+        EVP_DecryptUpdate(hctx, dec_len_buf, &outl, enc_len, 4);
+        EVP_CIPHER_CTX_free(hctx);
+    }
+
+    uint32_t pktlen = get_u32(dec_len_buf);
+    if (pktlen > RAWSSH_MAX_PACKET || pktlen < 2) return RAWSSH_PROTO_ERROR;
+
+    /* Step 2: Read encrypted payload + tag */
+    unsigned char *enc_payload = malloc(pktlen);
+    if (!enc_payload) return RAWSSH_ALLOC_FAIL;
+    rc = raw_recv(s, enc_payload, pktlen);
+    if (rc < 0) { free(enc_payload); return rc; }
+
+    unsigned char tag_recv[16];
+    rc = raw_recv(s, tag_recv, 16);
+    if (rc < 0) { free(enc_payload); return rc; }
+
+    /* Step 3: Derive Poly1305 key and verify tag */
+    unsigned char poly_key[32];
+    {
+        EVP_CIPHER_CTX *kctx = EVP_CIPHER_CTX_new();
+        if (!kctx) { free(enc_payload); return RAWSSH_ALLOC_FAIL; }
+        EVP_EncryptInit_ex(kctx, EVP_chacha20(), NULL, s->s2c.key, chacha_iv);
+        unsigned char zeros[32] = {0};
+        int outl = 0;
+        EVP_EncryptUpdate(kctx, poly_key, &outl, zeros, 32);
+        EVP_CIPHER_CTX_free(kctx);
+    }
+
+    unsigned char tag_calc[16];
+    {
+        EVP_MAC *mac = EVP_MAC_fetch(NULL, "POLY1305", NULL);
+        if (!mac) { free(enc_payload); return RAWSSH_ALLOC_FAIL; }
+        EVP_MAC_CTX *mctx = EVP_MAC_CTX_new(mac);
+        EVP_MAC_free(mac);
+        if (!mctx) { free(enc_payload); return RAWSSH_ALLOC_FAIL; }
+        OSSL_PARAM params[2];
+        params[0] = OSSL_PARAM_END;
+
+        EVP_MAC_init(mctx, poly_key, 32, params);
+        EVP_MAC_update(mctx, enc_len, 4);
+        EVP_MAC_update(mctx, enc_payload, pktlen);
+        size_t taglen = 16;
+        EVP_MAC_final(mctx, tag_calc, &taglen, 16);
+        EVP_MAC_CTX_free(mctx);
+    }
+
+    if (CRYPTO_memcmp(tag_recv, tag_calc, 16) != 0) {
+        free(enc_payload);
+        return RAWSSH_PROTO_ERROR;
+    }
+
+    /* Step 4: Decrypt payload with main key, counter starting at 1 */
+    unsigned char *dec_payload = malloc(pktlen);
+    if (!dec_payload) { free(enc_payload); return RAWSSH_ALLOC_FAIL; }
+    {
+        EVP_CIPHER_CTX *pctx = EVP_CIPHER_CTX_new();
+        if (!pctx) { free(dec_payload); free(enc_payload); return RAWSSH_ALLOC_FAIL; }
+        EVP_DecryptInit_ex(pctx, EVP_chacha20(), NULL, s->s2c.key, chacha_iv);
+        /* Skip first 64 bytes (counter block 0 used for poly1305 key) */
+        unsigned char discard[64];
+        int outl = 0;
+        EVP_DecryptUpdate(pctx, discard, &outl, discard, 64);
+        outl = 0;
+        EVP_DecryptUpdate(pctx, dec_payload, &outl, enc_payload, pktlen);
+        EVP_CIPHER_CTX_free(pctx);
+    }
+    free(enc_payload);
+
+    int padlen = dec_payload[0];
+    int datalen = pktlen - padlen - 1;
+    if (datalen < 0 || datalen > RAWSSH_MAX_PAYLOAD) {
+        free(dec_payload);
+        return RAWSSH_PROTO_ERROR;
+    }
+
+    memcpy(payload, dec_payload + 1, datalen);
+    *plen = datalen;
+    free(dec_payload);
+    s->s2c.seq++;
+    return RAWSSH_OK;
+}
+
+/* Receive an encrypted SSH packet - AES-CTR + HMAC mode */
 static int recv_packet_encrypted(rawssh_session *s, unsigned char *payload, int *plen) {
+    if (s->is_chacha20)
+        return recv_packet_chacha20(s, payload, plen);
+
     int block = s->s2c.cipher_block;
     if (block < 8) block = 8;
 
@@ -538,9 +756,9 @@ static const EVP_MD *get_kex_md(rawssh_session *s) {
     }
 }
 
-#define KEX_LIST "curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256,diffie-hellman-group14-sha256,diffie-hellman-group16-sha512,diffie-hellman-group14-sha1"
+#define KEX_LIST "curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256,diffie-hellman-group14-sha256,diffie-hellman-group16-sha512,diffie-hellman-group-exchange-sha256,diffie-hellman-group14-sha1"
 #define HOSTKEY_LIST "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-256,rsa-sha2-512,ssh-rsa"
-#define CIPHER_LIST "aes128-ctr,aes256-ctr"
+#define CIPHER_LIST "chacha20-poly1305@openssh.com,aes128-ctr,aes256-ctr"
 #define MAC_LIST "hmac-sha2-256,hmac-sha1"
 
 /* Build KEXINIT packet */
@@ -653,6 +871,8 @@ static int parse_kexinit(rawssh_session *s, const unsigned char *payload, int pl
         s->kex_type = 2; s->kex_hash_type = 1; /* sha256 */
     } else if (strstr(chosen_kex, "ecdh-sha2-nistp256")) {
         s->kex_type = 3; s->kex_hash_type = 1;
+    } else if (strstr(chosen_kex, "group-exchange-sha256")) {
+        s->kex_type = 4; s->kex_hash_type = 1; /* sha256 */
     } else if (strstr(chosen_kex, "group16")) {
         s->kex_type = 1; s->kex_hash_type = 2; /* sha512 */
     } else if (strstr(chosen_kex, "group14-sha256")) {
@@ -669,17 +889,29 @@ static int parse_kexinit(rawssh_session *s, const unsigned char *payload, int pl
     if (find_match(CIPHER_LIST, server_enc_s2c, chosen_cipher_s2c, sizeof(chosen_cipher_s2c)) < 0)
         return RAWSSH_PROTO_ERROR;
 
-    if (strstr(chosen_cipher_c2s, "aes256"))
+    /* Check for chacha20-poly1305@openssh.com */
+    if (strstr(chosen_cipher_c2s, "chacha20-poly1305")) {
+        s->is_chacha20 = 1;
+        s->cipher_key_len = 64; /* 2x32 bytes: main key + header key */
+    } else if (strstr(chosen_cipher_c2s, "aes256")) {
         s->cipher_key_len = 32;
-    else
+    } else {
         s->cipher_key_len = 16;
+    }
 
-    if (find_match(MAC_LIST, server_mac_c2s, chosen_mac_c2s, sizeof(chosen_mac_c2s)) < 0)
-        return RAWSSH_PROTO_ERROR;
-    if (find_match(MAC_LIST, server_mac_s2c, chosen_mac_s2c, sizeof(chosen_mac_s2c)) < 0)
-        return RAWSSH_PROTO_ERROR;
-
-    s->mac_is_sha256 = (strstr(chosen_mac_c2s, "sha2-256") != NULL);
+    /* For chacha20-poly1305, MAC is built into the cipher - no separate MAC needed */
+    if (s->is_chacha20) {
+        /* Try to negotiate MAC but don't fail if server doesn't offer any we support */
+        find_match(MAC_LIST, server_mac_c2s, chosen_mac_c2s, sizeof(chosen_mac_c2s));
+        find_match(MAC_LIST, server_mac_s2c, chosen_mac_s2c, sizeof(chosen_mac_s2c));
+        s->mac_is_sha256 = 0; /* unused with chacha20-poly1305 */
+    } else {
+        if (find_match(MAC_LIST, server_mac_c2s, chosen_mac_c2s, sizeof(chosen_mac_c2s)) < 0)
+            return RAWSSH_PROTO_ERROR;
+        if (find_match(MAC_LIST, server_mac_s2c, chosen_mac_s2c, sizeof(chosen_mac_s2c)) < 0)
+            return RAWSSH_PROTO_ERROR;
+        s->mac_is_sha256 = (strstr(chosen_mac_c2s, "sha2-256") != NULL);
+    }
 
     return RAWSSH_OK;
 }
@@ -818,33 +1050,62 @@ static int complete_kex(rawssh_session *s) {
     if (rc < 0) return rc;
     if (rpayload[0] != SSH_MSG_NEWKEYS) return RAWSSH_PROTO_ERROR;
 
-    int kl = s->cipher_key_len;
-    int bl = 16;
-    int mac_kl = s->mac_is_sha256 ? 32 : 20;
+    if (s->is_chacha20) {
+        /* chacha20-poly1305@openssh.com key derivation:
+         * K_1 (main key, 32 bytes) = derive_key 'C'/'D'
+         * K_2 (header key, 32 bytes) = derive_key with higher bytes of the 64-byte key
+         * Per OpenSSH: the cipher key is 64 bytes, first 32 = K_2 (header), last 32 = K_1 (main)
+         * But in practice: derive 64 bytes total, K_2 = bytes 0..31, K_1 = bytes 32..63
+         * We store K_1 in key[] and K_2 in mac_key[] */
+        unsigned char full_key_c2s[64], full_key_s2c[64];
+        derive_key(s, 'C', 64, full_key_c2s);
+        derive_key(s, 'D', 64, full_key_s2c);
 
-    derive_key(s, 'A', bl, s->c2s.iv);
-    derive_key(s, 'B', bl, s->s2c.iv);
-    derive_key(s, 'C', kl, s->c2s.key);
-    derive_key(s, 'D', kl, s->s2c.key);
-    derive_key(s, 'E', mac_kl, s->c2s.mac_key);
-    derive_key(s, 'F', mac_kl, s->s2c.mac_key);
+        /* K_1 (main encryption) = first 32 bytes, K_2 (header) = last 32 bytes */
+        memcpy(s->c2s.key, full_key_c2s, 32);      /* K_1 */
+        memcpy(s->c2s.mac_key, full_key_c2s + 32, 32); /* K_2 */
+        memcpy(s->s2c.key, full_key_s2c, 32);      /* K_1 */
+        memcpy(s->s2c.mac_key, full_key_s2c + 32, 32); /* K_2 */
 
-    const EVP_CIPHER *cipher = (kl == 32) ? EVP_aes_256_ctr() : EVP_aes_128_ctr();
+        /* No persistent cipher context needed - chacha20-poly1305 creates
+         * fresh contexts per-packet with sequence number as nonce */
+        s->c2s.ctx = NULL;
+        s->s2c.ctx = NULL;
+        s->c2s.cipher_block = 8;
+        s->s2c.cipher_block = 8;
+        s->c2s.key_len = 32;
+        s->s2c.key_len = 32;
+        s->c2s.mac_len = 0; /* Poly1305 replaces HMAC */
+        s->s2c.mac_len = 0;
+    } else {
+        int kl = s->cipher_key_len;
+        int bl = 16;
+        int mac_kl = s->mac_is_sha256 ? 32 : 20;
 
-    s->c2s.ctx = EVP_CIPHER_CTX_new();
-    EVP_EncryptInit_ex(s->c2s.ctx, cipher, NULL, s->c2s.key, s->c2s.iv);
-    s->c2s.cipher_block = bl;
-    s->c2s.key_len = kl;
-    s->c2s.mac_len = mac_kl;
+        derive_key(s, 'A', bl, s->c2s.iv);
+        derive_key(s, 'B', bl, s->s2c.iv);
+        derive_key(s, 'C', kl, s->c2s.key);
+        derive_key(s, 'D', kl, s->s2c.key);
+        derive_key(s, 'E', mac_kl, s->c2s.mac_key);
+        derive_key(s, 'F', mac_kl, s->s2c.mac_key);
 
-    s->s2c.ctx = EVP_CIPHER_CTX_new();
-    EVP_DecryptInit_ex(s->s2c.ctx, cipher, NULL, s->s2c.key, s->s2c.iv);
-    s->s2c.cipher_block = bl;
-    s->s2c.key_len = kl;
-    s->s2c.mac_len = mac_kl;
+        const EVP_CIPHER *cipher = (kl == 32) ? EVP_aes_256_ctr() : EVP_aes_128_ctr();
 
-    EVP_CIPHER_CTX_set_padding(s->c2s.ctx, 0);
-    EVP_CIPHER_CTX_set_padding(s->s2c.ctx, 0);
+        s->c2s.ctx = EVP_CIPHER_CTX_new();
+        EVP_EncryptInit_ex(s->c2s.ctx, cipher, NULL, s->c2s.key, s->c2s.iv);
+        s->c2s.cipher_block = bl;
+        s->c2s.key_len = kl;
+        s->c2s.mac_len = mac_kl;
+
+        s->s2c.ctx = EVP_CIPHER_CTX_new();
+        EVP_DecryptInit_ex(s->s2c.ctx, cipher, NULL, s->s2c.key, s->s2c.iv);
+        s->s2c.cipher_block = bl;
+        s->s2c.key_len = kl;
+        s->s2c.mac_len = mac_kl;
+
+        EVP_CIPHER_CTX_set_padding(s->c2s.ctx, 0);
+        EVP_CIPHER_CTX_set_padding(s->s2c.ctx, 0);
+    }
     s->encrypted = 1;
     return RAWSSH_OK;
 }
@@ -1002,6 +1263,135 @@ static int do_kex_ecdh_p256(rawssh_session *s) {
     rc = compute_exchange_hash_ecdh(s, k_s, k_s_len, cpub, cpub_len, spub_data, spub_len);
     free(cpub);
     EC_KEY_free(ec);
+    if (rc < 0) return rc;
+    return complete_kex(s);
+}
+
+/* ========== KEX: diffie-hellman-group-exchange-sha256 (RFC 4419) ========== */
+
+/* Exchange hash for DH-GEX includes min/n/max and p/g from server */
+static int compute_exchange_hash_gex(rawssh_session *s,
+                                      const unsigned char *k_s, int k_s_len,
+                                      uint32_t gex_min, uint32_t gex_n, uint32_t gex_max,
+                                      const BIGNUM *p, const BIGNUM *g,
+                                      const BIGNUM *e, const BIGNUM *f,
+                                      const BIGNUM *k) {
+    const EVP_MD *md = get_kex_md(s);
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(ctx, md, NULL);
+
+    int off = 0;
+    unsigned char tmp[8192];
+    put_cstring(tmp, s->client_version, &off);
+    EVP_DigestUpdate(ctx, tmp, off);
+    off = 0;
+    put_cstring(tmp, s->server_version, &off);
+    EVP_DigestUpdate(ctx, tmp, off);
+
+    put_u32(tmp, s->my_kexinit_len);
+    EVP_DigestUpdate(ctx, tmp, 4);
+    EVP_DigestUpdate(ctx, s->my_kexinit, s->my_kexinit_len);
+    put_u32(tmp, s->peer_kexinit_len);
+    EVP_DigestUpdate(ctx, tmp, 4);
+    EVP_DigestUpdate(ctx, s->peer_kexinit, s->peer_kexinit_len);
+
+    off = 0;
+    put_string(tmp, k_s, k_s_len, &off);
+    EVP_DigestUpdate(ctx, tmp, off);
+
+    /* GEX-specific: min, preferred, max */
+    unsigned char gex_buf[12];
+    put_u32(gex_buf, gex_min);
+    put_u32(gex_buf + 4, gex_n);
+    put_u32(gex_buf + 8, gex_max);
+    EVP_DigestUpdate(ctx, gex_buf, 12);
+
+    /* p, g as mpints */
+    off = 0; put_mpint(tmp, p, &off); EVP_DigestUpdate(ctx, tmp, off);
+    off = 0; put_mpint(tmp, g, &off); EVP_DigestUpdate(ctx, tmp, off);
+
+    /* e, f, K as mpints */
+    off = 0; put_mpint(tmp, e, &off); EVP_DigestUpdate(ctx, tmp, off);
+    off = 0; put_mpint(tmp, f, &off); EVP_DigestUpdate(ctx, tmp, off);
+    off = 0; put_mpint(tmp, k, &off); EVP_DigestUpdate(ctx, tmp, off);
+
+    unsigned int hlen;
+    EVP_DigestFinal_ex(ctx, s->exchange_hash, &hlen);
+    EVP_MD_CTX_free(ctx);
+
+    s->session_id_len = hlen;
+    if (!s->session_id[0] && !s->session_id[1])
+        memcpy(s->session_id, s->exchange_hash, hlen);
+    return RAWSSH_OK;
+}
+
+static int do_kex_dh_gex(rawssh_session *s) {
+    /* Step 1: Send GEX_REQUEST with min/preferred/max bits */
+    uint32_t gex_min = 2048, gex_n = 4096, gex_max = 8192;
+
+    unsigned char payload[64];
+    int off = 0;
+    payload[off++] = SSH_MSG_KEX_DH_GEX_REQUEST; /* 34 */
+    put_u32(payload + off, gex_min); off += 4;
+    put_u32(payload + off, gex_n); off += 4;
+    put_u32(payload + off, gex_max); off += 4;
+
+    int rc = send_packet(s, payload, off);
+    if (rc < 0) return rc;
+
+    /* Step 2: Receive GEX_GROUP (p, g from server) */
+    unsigned char rpayload[RAWSSH_MAX_PAYLOAD];
+    int rplen;
+    rc = recv_packet(s, rpayload, &rplen);
+    if (rc < 0) return rc;
+    if (rpayload[0] != SSH_MSG_KEX_DH_GEX_GROUP) return RAWSSH_PROTO_ERROR;
+
+    off = 1;
+    const unsigned char *p_data; uint32_t p_len;
+    if (get_string(rpayload, rplen, &off, &p_data, &p_len) < 0) return RAWSSH_PROTO_ERROR;
+    const unsigned char *g_data; uint32_t g_len;
+    if (get_string(rpayload, rplen, &off, &g_data, &g_len) < 0) return RAWSSH_PROTO_ERROR;
+
+    s->dh_p = BN_new(); s->dh_g = BN_new();
+    s->dh_x = BN_new(); s->dh_e = BN_new();
+    BN_bin2bn(p_data, p_len, s->dh_p);
+    BN_bin2bn(g_data, g_len, s->dh_g);
+
+    /* Step 3: Generate client DH key and send GEX_INIT */
+    BN_rand(s->dh_x, 256, BN_RAND_TOP_ONE, BN_RAND_BOTTOM_ANY);
+    BN_CTX *bnctx = BN_CTX_new();
+    BN_mod_exp(s->dh_e, s->dh_g, s->dh_x, s->dh_p, bnctx);
+
+    unsigned char init_payload[1024];
+    off = 0;
+    init_payload[off++] = SSH_MSG_KEX_DH_GEX_INIT; /* 32 */
+    put_mpint(init_payload, s->dh_e, &off);
+
+    rc = send_packet(s, init_payload, off);
+    if (rc < 0) { BN_CTX_free(bnctx); return rc; }
+
+    /* Step 4: Receive GEX_REPLY */
+    rc = recv_packet(s, rpayload, &rplen);
+    if (rc < 0) { BN_CTX_free(bnctx); return rc; }
+    if (rpayload[0] != SSH_MSG_KEX_DH_GEX_REPLY) { BN_CTX_free(bnctx); return RAWSSH_PROTO_ERROR; }
+
+    off = 1;
+    const unsigned char *k_s_data; uint32_t k_s_len;
+    if (get_string(rpayload, rplen, &off, &k_s_data, &k_s_len) < 0) { BN_CTX_free(bnctx); return RAWSSH_PROTO_ERROR; }
+    const unsigned char *f_data; uint32_t f_len;
+    if (get_string(rpayload, rplen, &off, &f_data, &f_len) < 0) { BN_CTX_free(bnctx); return RAWSSH_PROTO_ERROR; }
+
+    s->dh_f = BN_new();
+    BN_bin2bn(f_data, f_len, s->dh_f);
+    s->dh_k = BN_new();
+    BN_mod_exp(s->dh_k, s->dh_f, s->dh_x, s->dh_p, bnctx);
+    BN_CTX_free(bnctx);
+
+    /* Compute exchange hash (includes GEX-specific fields) */
+    rc = compute_exchange_hash_gex(s, k_s_data, k_s_len,
+                                    gex_min, gex_n, gex_max,
+                                    s->dh_p, s->dh_g,
+                                    s->dh_e, s->dh_f, s->dh_k);
     if (rc < 0) return rc;
     return complete_kex(s);
 }
@@ -1202,6 +1592,7 @@ int rawssh_handshake(rawssh_session *s) {
     switch (s->kex_type) {
         case 2: rc = do_kex_curve25519(s); break;
         case 3: rc = do_kex_ecdh_p256(s); break;
+        case 4: rc = do_kex_dh_gex(s); break; /* group-exchange-sha256 */
         default: rc = do_kex_dh(s); break; /* group14 or group16 */
     }
     if (rc < 0) return rc;

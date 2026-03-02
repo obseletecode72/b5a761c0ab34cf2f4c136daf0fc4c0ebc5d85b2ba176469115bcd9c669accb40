@@ -34,6 +34,13 @@
 #define SSH_MSG_KEXDH_INIT       30
 #define SSH_MSG_KEXDH_REPLY      31
 
+/* DH Group Exchange (RFC 4419) */
+#define SSH_MSG_KEX_DH_GEX_REQUEST_OLD 30
+#define SSH_MSG_KEX_DH_GEX_GROUP       31
+#define SSH_MSG_KEX_DH_GEX_INIT        32
+#define SSH_MSG_KEX_DH_GEX_REPLY       33
+#define SSH_MSG_KEX_DH_GEX_REQUEST     34
+
 /* SSH message types (RFC 4252 - User Auth) */
 #define SSH_MSG_USERAUTH_REQUEST      50
 #define SSH_MSG_USERAUTH_FAILURE      51
@@ -58,7 +65,7 @@
 #define RAWSSH_MAX_PAYLOAD   8192
 #define RAWSSH_BLOCK_SIZE    16
 #define RAWSSH_IV_SIZE       16
-#define RAWSSH_KEY_SIZE      32
+#define RAWSSH_KEY_SIZE      64
 #define RAWSSH_MAC_SIZE      32
 #define RAWSSH_HASH_SIZE     64
 
