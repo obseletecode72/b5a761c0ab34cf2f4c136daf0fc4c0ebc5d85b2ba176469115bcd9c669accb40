@@ -79,9 +79,6 @@ struct rawssh_session {
     int authenticated;
     int handshake_step;
     uint32_t next_channel_id;
-    uint32_t last_disconnect_reason;
-    char disconnect_msg[128];
-    char cipher_name[64];
 };
 
 struct rawssh_channel {
@@ -161,9 +158,7 @@ static int sock_wait(int fd, int events, int timeout_ms) {
     int r = poll(&pf, 1, timeout_ms);
     if (r <= 0) return r;
     if (pf.revents & POLLNVAL) return -1;
-    /* Always allow reading if data is available, even if POLLHUP is also set */
-    if (pf.revents & POLLIN) return r;
-    if (pf.revents & POLLOUT) return r;
+    if ((events & POLLIN) && (pf.revents & POLLIN)) return r;
     if (pf.revents & (POLLERR | POLLHUP)) return -1;
     return r;
 }
@@ -760,26 +755,10 @@ static int recv_packet(rawssh_session *s, unsigned char *payload, int *plen) {
     for (int i = 0; i < 20; i++) {
         int rc = recv_packet_raw(s, payload, plen);
         if (rc < 0) return rc;
-        if (payload[0] == SSH_MSG_DISCONNECT) {
-            if (*plen >= 5) {
-                s->last_disconnect_reason = get_u32(payload + 1);
-                if (*plen > 9) {
-                    int doff = 5;
-                    const unsigned char *msg_data; uint32_t msg_len;
-                    if (get_string(payload, *plen, &doff, &msg_data, &msg_len) >= 0 && msg_len > 0) {
-                        int cpy = (int)msg_len < 127 ? (int)msg_len : 127;
-                        memcpy(s->disconnect_msg, msg_data, cpy);
-                        s->disconnect_msg[cpy] = 0;
-                    }
-                }
-            }
-            return RAWSSH_CLOSED;
-        }
+        if (payload[0] == SSH_MSG_DISCONNECT) return RAWSSH_CLOSED;
         if (payload[0] == SSH_MSG_IGNORE || payload[0] == SSH_MSG_DEBUG)
             continue;
         if (payload[0] == SSH_MSG_UNIMPLEMENTED)
-            continue;
-        if (payload[0] == 7) /* SSH_MSG_EXT_INFO - OpenSSH 7.6+ */
             continue;
         return rc;
     }
@@ -1039,8 +1018,6 @@ static int parse_kexinit(rawssh_session *s, const unsigned char *payload, int pl
     }
 
     s->handshake_step = 3;
-    snprintf(s->cipher_name, sizeof(s->cipher_name), "%s/%s/%s",
-             chosen_kex, chosen_cipher_c2s, chosen_mac_c2s);
     return RAWSSH_OK;
 }
 
@@ -1534,35 +1511,17 @@ static int request_service(rawssh_session *s, const char *service) {
 
     unsigned char rpayload[RAWSSH_MAX_PAYLOAD];
     int rplen;
+    rc = recv_packet(s, rpayload, &rplen);
+    if (rc < 0) return rc;
 
-    /* Some servers send GLOBAL_REQUEST, IGNORE, or BANNER before SERVICE_ACCEPT */
-    for (int i = 0; i < 10; i++) {
+    while (rpayload[0] == SSH_MSG_USERAUTH_BANNER) {
         rc = recv_packet(s, rpayload, &rplen);
         if (rc < 0) return rc;
-
-        if (rpayload[0] == SSH_MSG_SERVICE_ACCEPT)
-            return RAWSSH_OK;
-        if (rpayload[0] == SSH_MSG_USERAUTH_BANNER)
-            continue;
-        if (rpayload[0] == SSH_MSG_GLOBAL_REQUEST) {
-            /* Send back a REQUEST_FAILURE if want-reply is set */
-            if (rplen > 5) {
-                const unsigned char *name_data; uint32_t name_len;
-                int roff = 1;
-                if (get_string(rpayload, rplen, &roff, &name_data, &name_len) >= 0) {
-                    if (roff < rplen && rpayload[roff]) {
-                        unsigned char fail = 82; /* SSH_MSG_REQUEST_FAILURE */
-                        send_packet(s, &fail, 1);
-                    }
-                }
-            }
-            continue;
-        }
-        /* Unknown message type during service request */
-        break;
     }
 
-    return RAWSSH_PROTO_ERROR;
+    if (rpayload[0] != SSH_MSG_SERVICE_ACCEPT) return RAWSSH_PROTO_ERROR;
+
+    return RAWSSH_OK;
 }
 
 int rawssh_global_init(void) {
@@ -1645,7 +1604,7 @@ int rawssh_connect(rawssh_session *s, const char *host, int port) {
     connect(s->sock, (struct sockaddr *)&addr, sizeof(addr));
 
     struct pollfd pf = {s->sock, POLLOUT, 0};
-    int connect_tmo = (s->timeout_sec > 2) ? 1500 : s->timeout_sec * 1000;
+    int connect_tmo = (s->timeout_sec > 2) ? 2000 : s->timeout_sec * 1000;
     if (poll(&pf, 1, connect_tmo) <= 0) {
         close(s->sock);
         s->sock = -1;
@@ -1992,16 +1951,4 @@ const char *rawssh_handshake_step_str(rawssh_session *s) {
         case 35: return "negotiate_mac_s2c";
         default: return "unknown";
     }
-}
-
-uint32_t rawssh_disconnect_reason(rawssh_session *s) {
-    return s ? s->last_disconnect_reason : 0;
-}
-
-const char *rawssh_disconnect_msg(rawssh_session *s) {
-    return (s && s->disconnect_msg[0]) ? s->disconnect_msg : "";
-}
-
-const char *rawssh_cipher_info(rawssh_session *s) {
-    return (s && s->cipher_name[0]) ? s->cipher_name : "unknown";
 }

@@ -103,8 +103,5 @@ const char *rawssh_error_str(int err);
 int rawssh_get_sock(rawssh_session *s);
 int rawssh_handshake_step(rawssh_session *s);
 const char *rawssh_handshake_step_str(rawssh_session *s);
-uint32_t rawssh_disconnect_reason(rawssh_session *s);
-const char *rawssh_disconnect_msg(rawssh_session *s);
-const char *rawssh_cipher_info(rawssh_session *s);
 
 #endif /* RAWSSH_H */
