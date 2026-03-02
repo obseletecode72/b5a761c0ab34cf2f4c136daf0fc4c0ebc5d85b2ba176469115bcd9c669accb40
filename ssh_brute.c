@@ -247,6 +247,9 @@ static void process(int idx) {
     Target *t = &g_targets[idx];
     atomic_fetch_add(&G_active, 1);
 
+    /* Thread-local RNG seed (rand() is NOT thread-safe) */
+    unsigned int rng_seed = (unsigned int)(idx ^ time(NULL) ^ (uintptr_t)pthread_self());
+
     sem_wait(&g_sem);
 
     rawssh_session *ses = open_session(t->ip, t->port);
@@ -264,7 +267,7 @@ static void process(int idx) {
         /* Preemptive reconnect before server kicks us */
         if (auth_count >= AUTH_PER_CONN) {
             close_session(ses);
-            usleep(50000 + (rand() % 50000)); /* 50-100ms backoff between reconnects */
+            usleep(50000 + (rand_r(&rng_seed) % 50000)); /* 50-100ms backoff between reconnects */
             ses = open_session(t->ip, t->port);
             if (!ses) {
                 /* Retry once after longer backoff */
@@ -320,7 +323,7 @@ static void process(int idx) {
 
         if (rc == RAWSSH_CLOSED) {
             /* Server disconnect (e.g. MaxAuthTries) - reconnect with backoff */
-            usleep(100000 + (rand() % 100000)); /* 100-200ms backoff */
+            usleep(100000 + (rand_r(&rng_seed) % 100000)); /* 100-200ms backoff */
             ses = open_session(t->ip, t->port);
             if (!ses) {
                 sem_post(&g_sem);
@@ -452,7 +455,7 @@ int main(int argc,char **argv){
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr,128*1024);
+    pthread_attr_setstacksize(&attr,64*1024); /* 64KB per thread - sufficient for process() */
 
     pthread_t panel;
     pthread_create(&panel,NULL,panel_fn,NULL);
