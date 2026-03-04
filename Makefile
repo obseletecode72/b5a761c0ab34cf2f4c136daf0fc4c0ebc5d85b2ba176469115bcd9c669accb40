@@ -3,8 +3,15 @@
 # Requer: libssl-dev (apt install libssl-dev)
 
 CC = gcc
-CFLAGS = -std=c11 -O3 -march=native -mtune=native -Wall -Wextra -pthread -D_GNU_SOURCE -I/opt/openssl3/include
-LDFLAGS = -L/opt/openssl3/lib64 -lssl -lcrypto -lpthread -Wl,-rpath=/opt/openssl3/lib64
+CFLAGS = -std=c11 -O3 -march=native -mtune=native -Wall -Wextra -pthread -D_GNU_SOURCE
+LDFLAGS = -lssl -lcrypto -lpthread
+
+# Usa pkg-config se disponivel para achar OpenSSL automaticamente
+PKG_CONFIG := $(shell command -v pkg-config 2>/dev/null)
+ifneq ($(PKG_CONFIG),)
+  CFLAGS += $(shell pkg-config --cflags openssl 2>/dev/null)
+  LDFLAGS := $(shell pkg-config --libs openssl 2>/dev/null) -lpthread
+endif
 
 TARGET = ssh_brute
 OBJS = rawssh.o ssh_brute.o
